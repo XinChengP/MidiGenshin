@@ -59,7 +59,7 @@ def test_keys():
     check("圆号无Z行", "Z" not in WIND_HORN.key_names and "M" not in WIND_HORN.key_names)
 
 
-# ---------------- 晚风圆号映射 ----------------
+# ---------------- 原琴·两排映射 ----------------
 
 def test_map_horn():
     p = MapParams(instrument=WIND_HORN)
@@ -294,9 +294,9 @@ def test_export(tmp="test_out.txt"):
     lines = data.split("\r\n")
     check("行数 = 头 6 + 事件 4 + 尾空", len(lines) == 6 + 4 + 1, str(len(lines)))
     check("版本头", lines[0] == "# genshin-lyre-script v1")
-    check("乐器头", lines[2] == "# instrument=风物之诗琴", lines[2])
+    check("乐器头", lines[2] == "# instrument=原琴（三排）", lines[2])
     check("事件行", lines[6] == "0.000\tA" and lines[7] == "1.000\tD")
-    check("CRLF + UTF-8", data.endswith("\r\n") and "原琴" not in data)
+    check("CRLF + UTF-8", data.endswith("\r\n") and "\tA\r\n" in data)
     check("返回事件数", n == 4)
     # 分:秒 格式 + 速度缩放
     export_script(r, MapParams(), tmp, clock_format=True, include_header=False, speed=2.0)

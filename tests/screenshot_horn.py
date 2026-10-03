@@ -23,16 +23,16 @@ def main():
                                "examples", "demo.mid"))
 
     lyre_dropped = win.result.stats.dropped_range
-    win.cmb_instrument.setCurrentIndex(1)  # 晚风圆号
+    win.cmb_instrument.setCurrentIndex(1)  # 原琴（两排）
 
     def verify_and_shoot():
         inst = win._current_params().instrument
-        assert inst.name == "晚风圆号", inst.name
+        assert inst.name == "原琴（两排）", inst.name
         ref = win._lbl_key_ref.text()
         assert "低音" not in ref and "中音" in ref and "高音" in ref, ref
         horn_dropped = win.result.stats.dropped_range
         print(f"键位速查：{ref!r}")
-        print(f"丢弃数：琴 {lyre_dropped} -> 圆号 {horn_dropped}（低音区被弃，应增加）")
+        print(f"丢弃数：三排 {lyre_dropped} -> 两排 {horn_dropped}（低音区被弃，应增加）")
         assert horn_dropped > lyre_dropped
         out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "build", "shot_horn.png")

@@ -429,7 +429,7 @@ class MainWindow(QWidget):
         dz.addWidget(t1)
         dz.addWidget(t2)
         self.drop_zone.mousePressEvent = lambda e: self._open_file_dialog()
-        hint = QLabel("多轨合并 · 自动变速识别 · 21 键风物之诗琴映射")
+        hint = QLabel("多轨合并 · 自动变速识别 · 原琴键位映射")
         hint.setStyleSheet("color: #9AA2AE; font-size: 12px;")
         lay.addWidget(self.drop_zone)
         lay.addSpacing(18)
@@ -1029,8 +1029,14 @@ class MainWindow(QWidget):
         self._status_label.setText(msg)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape and self._playing:
+        key = event.key()
+        ctrl = event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        if key == Qt.Key.Key_Escape and self._playing:
             self._on_stop()
+        elif ctrl and key == Qt.Key.Key_O:
+            self._open_file_dialog()
+        elif ctrl and key == Qt.Key.Key_S:
+            self._on_export()
         else:
             super().keyPressEvent(event)
 

@@ -1,10 +1,10 @@
 """乐器键位定义与 MIDI 音高映射。
 
-支持两种乐器：
-- 风物之诗琴：21 键三行（低 Z 行 / 中 A 行 / 高 Q 行），音域 C3–B5
-- 晚风圆号：  14 键两行（中 A 行 / 高 Q 行），音域 C4–B5，无低音行
+支持两种原琴键位布局：
+- 原琴·三排：21 键三行（低 Z 行 / 中 A 行 / 高 Q 行），音域 C3–B5
+- 原琴·两排：14 键两行（中 A 行 / 高 Q 行），音域 C4–B5，无低音行
 
-按键的虚拟键码 / 扫描码按字符全局共享（两乐器的同名键物理键相同）。
+按键的虚拟键码 / 扫描码按字符全局共享（两布局的同名键物理键相同）。
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ class LyreKey:
     name: str
     vk: int
     scan: int
-    midi_pitch: int  # 风物之诗琴布局下的音高（C3–B5）
+    midi_pitch: int  # 三排布局下的音高（C3–B5）
 
     @property
     def note_name(self) -> str:
@@ -102,12 +102,12 @@ def _build_instrument(inst_id: str, name: str,
 
 
 WIND_LYRE = _build_instrument(
-    "lyre", "风物之诗琴",
+    "lyre", "原琴（三排）",
     ((ROW_LOW, 3), (ROW_MID, 4), (ROW_HIGH, 5)),
 )
 WIND_HORN = _build_instrument(
-    "horn", "晚风圆号",
-    # 晚风圆号：仅两行，无低音行；中音行 C4 起
+    "horn", "原琴（两排）",
+    # 两排布局：无低音行；中音行 C4 起
     ((ROW_MID, 4), (ROW_HIGH, 5)),
 )
 INSTRUMENTS: dict[str, Instrument] = {"lyre": WIND_LYRE, "horn": WIND_HORN}
