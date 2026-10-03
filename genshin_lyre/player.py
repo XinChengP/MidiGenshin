@@ -18,6 +18,7 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 winmm = ctypes.WinDLL("winmm", use_last_error=True)
 
 VK_F8 = 0x77
+STOP_KEY_VKS = {"F8": 0x77, "F9": 0x78, "F10": 0x79, "F11": 0x7A, "F12": 0x7B}
 CORRECTIVE_GAP = 0.002   # 同键重按前强制提前松开的提前量
 SPIN_WINDOW = 0.004      # 最后 4ms 用自旋等待保证精度
 COARSE_SLEEP = 0.002
@@ -64,8 +65,12 @@ def send_key(scan: int, up: bool) -> bool:
     return user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) == 1
 
 
+def is_stop_key_pressed(vk: int = VK_F8) -> bool:
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+
 def is_f8_pressed() -> bool:
-    return bool(user32.GetAsyncKeyState(VK_F8) & 0x8000)
+    return is_stop_key_pressed(VK_F8)
 
 
 def get_foreground_hwnd() -> int:
@@ -196,6 +201,7 @@ class Player(threading.Thread):
         on_progress=None,                 # fn(event_idx: int)
         on_state=None,                    # fn(state: str, detail: str)
         focus_guard_hwnd: int | None = None,  # 演奏中切回该窗口则自动暂停
+        stop_vk: int = VK_F8,             # 全局急停键虚拟键码
         time_scale_check: bool = True,
     ):
         super().__init__(daemon=True, name="lyre-player")
@@ -204,6 +210,10 @@ class Player(threading.Thread):
         self.on_progress = on_progress
         self.on_state = on_state
         self.focus_guard_hwnd = focus_guard_hwnd
+        self._stop_vk = stop_vk
+        self._seek_pending = False
+        self._seek_time = 0.0
+        self._seek_floor = 0
 
         self._stop_evt = threading.Event()
         self._pause_evt = threading.Event()
@@ -229,6 +239,20 @@ class Player(threading.Thread):
     def stop(self):
         self._stop_evt.set()
         self._pause_evt.clear()
+        self._release_all()  # 立即松开，防止进程退出前 keyup 未来得及发送
+
+    def seek(self, event_idx: int):
+        """跳播：从首个序号 >= event_idx 的按下动作继续（释放当前所有按住的键）。"""
+        target_t = None
+        for a in self.actions:
+            if a.kind == "down" and a.event_idx is not None and a.event_idx >= event_idx:
+                target_t = a.time
+                break
+        if target_t is None:
+            return
+        self._seek_floor = event_idx
+        self._seek_time = target_t
+        self._seek_pending = True
 
     # ---- 内部 ----
     def _set_state(self, state: str, detail: str = ""):
@@ -246,7 +270,7 @@ class Player(threading.Thread):
 
     def _check_abort_keys(self) -> bool:
         """返回 True 表示需要终止。"""
-        if is_f8_pressed():
+        if is_stop_key_pressed(self._stop_vk):
             self._stop_evt.set()
             self._set_state("aborted", "hotkey")
             return True
@@ -269,6 +293,11 @@ class Player(threading.Thread):
     def _wait_until(self, target: float) -> bool:
         """等到演奏时间轴的 target 秒。返回 False 表示终止。"""
         while not self._stop_evt.is_set():
+            if self._seek_pending:
+                self._seek_pending = False
+                if self._held:
+                    self._release_all()
+                self._origin = time.perf_counter() - self._seek_time
             if self._check_abort_keys():
                 return False
             self._check_focus()
@@ -321,6 +350,9 @@ class Player(threading.Thread):
         for action in self.actions:
             if not self._wait_until(action.time):
                 break
+            if (action.kind == "down" and action.event_idx is not None
+                    and action.event_idx < self._seek_floor):
+                continue  # 跳播地板之前的动作不再发送
             if action.kind == "down":
                 for key in action.keys:
                     if not self.sender.down(key):

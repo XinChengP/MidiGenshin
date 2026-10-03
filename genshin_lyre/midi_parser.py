@@ -27,6 +27,7 @@ class NoteEvent:
     velocity: int
     start: float  # 秒
     end: float    # 秒（note-off）
+    track: int = 0  # 来源音轨序号（0 起算）
 
 
 @dataclass
@@ -103,11 +104,11 @@ def parse_midi(data: bytes, filepath: str = "", include_drums: bool = False) -> 
     note_on_count = 0
     seen_tracks = 0
 
-    ons: list[tuple[int, int, int, int]] = []   # (tick, ch, pitch, vel)
-    offs: list[tuple[int, int, int]] = []       # (tick, ch, pitch)
+    ons: list[tuple[int, int, int, int, int]] = []   # (tick, ch, pitch, vel, track)
+    offs: list[tuple[int, int, int, int]] = []       # (tick, ch, pitch, track)
     tempos: list[tuple[int, int]] = []          # (tick, us_per_quarter)
 
-    for _ in range(ntrks):
+    for t_i in range(ntrks):
         chunk = _read_chunk(data, pos)
         if chunk is None:
             warnings.append("音轨块缺失，文件可能被截断")
@@ -166,26 +167,26 @@ def parse_midi(data: bytes, filepath: str = "", include_drums: bool = False) -> 
                     continue  # 打击乐通道默认忽略
                 if cmd == 0x90 and d2 > 0:
                     note_on_count += 1
-                    ons.append((tick, ch, d1, d2))
+                    ons.append((tick, ch, d1, d2, t_i))
                 elif cmd == 0x80 or (cmd == 0x90 and d2 == 0):
-                    offs.append((tick, ch, d1))
+                    offs.append((tick, ch, d1, t_i))
                 # 其余通道事件（CC/弯音/音色等）与演奏无关，忽略
 
     if seen_tracks == 0:
         raise MidiError("文件中没有音轨块")
 
     # ---- 音符配对：同 (ch, pitch) 内，新 note-on 截断前一个未闭合音符 ----
-    ons_by: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
-    for tick, ch, pitch, vel in ons:
-        ons_by[(ch, pitch)].append((tick, vel))
-    offs_by: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for tick, ch, pitch in offs:
-        offs_by[(ch, pitch)].append(tick)
+    ons_by: dict[tuple[int, int, int], list[tuple[int, int, int]]] = defaultdict(list)
+    for tick, ch, pitch, vel, trk in ons:
+        ons_by[(ch, pitch, trk)].append((tick, vel))
+    offs_by: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+    for tick, ch, pitch, trk in offs:
+        offs_by[(ch, pitch, trk)].append(tick)
 
-    pairs: list[tuple[int, int, int, int, int]] = []  # (start, end, ch, pitch, vel)
-    for (ch, pitch), olist in ons_by.items():
+    pairs: list[tuple[int, int, int, int, int, int]] = []  # (start, end, ch, pitch, vel, track)
+    for (ch, pitch, trk), olist in ons_by.items():
         olist.sort()
-        flist = sorted(offs_by.get((ch, pitch), []))
+        flist = sorted(offs_by.get((ch, pitch, trk), []))
         # 同 tick 时 off(0) 先于 on(1) 处理（同键重弹视为两个音符）
         events = [(t, 1, v) for t, v in olist] + [(t, 0, 0) for t in flist]
         events.sort()
@@ -194,15 +195,15 @@ def parse_midi(data: bytes, filepath: str = "", include_drums: bool = False) -> 
         for tick, kind, vel in events:
             if kind == 1:
                 if open_start is not None:  # 被新音符截断
-                    pairs.append((open_start, tick, ch, pitch, open_vel))
+                    pairs.append((open_start, tick, ch, pitch, open_vel, trk))
                 open_start, open_vel = tick, vel
             else:
                 if open_start is not None:
-                    pairs.append((open_start, tick, ch, pitch, open_vel))
+                    pairs.append((open_start, tick, ch, pitch, open_vel, trk))
                     open_start = None
         if open_start is not None:  # 兜底：无 note-off，以最后一个 off 或自身为终点
             end = flist[-1] if flist and flist[-1] > open_start else open_start
-            pairs.append((open_start, max(open_start, end), ch, pitch, open_vel))
+            pairs.append((open_start, max(open_start, end), ch, pitch, open_vel, trk))
 
     if not pairs:
         raise MidiError("未发现音符事件（可能只有打击乐轨或空谱）")
@@ -233,8 +234,8 @@ def parse_midi(data: bytes, filepath: str = "", include_drums: bool = False) -> 
         return cum_s[i] + (tick - cum_t[i]) * us_list[i] / ppq / 1e6
 
     notes = [
-        NoteEvent(ch, pitch, vel, tick_to_sec(s), tick_to_sec(e))
-        for s, e, ch, pitch, vel in pairs
+        NoteEvent(ch, pitch, vel, tick_to_sec(s), tick_to_sec(e), trk)
+        for s, e, ch, pitch, vel, trk in pairs
     ]
     notes.sort(key=lambda x: (x.start, x.pitch))
 

@@ -77,6 +77,7 @@ class MapStats:
     direct: int = 0           # 白键直击
     snapped: int = 0          # 黑键吸附
     dropped_range: int = 0    # 音域外丢弃
+    dropped_blackkey: int = 0   # 黑键因策略为"直接丢弃"而丢弃
     dropped_collision: int = 0  # 同和弦重键丢弃
     chord_groups: int = 0
     min_dropped_pitch: int | None = None
@@ -89,7 +90,7 @@ class MapStats:
 
     @property
     def dropped(self) -> int:
-        return self.dropped_range + self.dropped_collision
+        return self.dropped_range + self.dropped_blackkey + self.dropped_collision
 
 
 @dataclass
@@ -113,7 +114,7 @@ def _map_pitch(pitch: int, params: MapParams, stats: MapStats) -> str | None:
         stats.direct += 1
         return inst.pitch_to_key[pitch]
     if params.snap == SNAP_DROP:
-        stats.dropped_range += 1
+        stats.dropped_blackkey += 1
         return None
     snap_table = inst.snap_down if params.snap == SNAP_DOWN else inst.snap_up
     key = snap_table.get(pitch)
@@ -124,14 +125,18 @@ def _map_pitch(pitch: int, params: MapParams, stats: MapStats) -> str | None:
     return key
 
 
-def map_song(song: MidiSong, params: MapParams) -> MapResult:
+def map_song(song: MidiSong, params: MapParams,
+             exclude_tracks: frozenset[int] | set[int] | None = None) -> MapResult:
     params = params.validate()
-    stats = MapStats(total=len(song.notes))
-    stats.first_note_time = min((n.start for n in song.notes), default=0.0)
+    notes = song.notes
+    if exclude_tracks:
+        notes = [n for n in notes if n.track not in exclude_tracks]
+    stats = MapStats(total=len(notes))
+    stats.first_note_time = min((n.start for n in notes), default=0.0)
 
     # 1) 逐音符映射到键，携带（时间, 移调后音高, 键, 结束时间）
     mapped: list[tuple[float, int, str, float]] = []
-    for note in song.notes:
+    for note in notes:
         pitch = note.pitch + params.transpose
         key = _map_pitch(pitch, params, stats)
         if key is not None:
@@ -198,7 +203,10 @@ def suggest_transpose(song: MidiSong, params: MapParams) -> int:
 
 def dropped_summary(result: MapResult) -> str:
     s = result.stats
-    parts = [f"音域外 {s.dropped_range}", f"重键冲突 {s.dropped_collision}"]
+    parts = [f"音域外 {s.dropped_range}"]
+    if s.dropped_blackkey:
+        parts.append(f"黑键丢弃 {s.dropped_blackkey}")
+    parts.append(f"重键冲突 {s.dropped_collision}")
     if s.min_dropped_pitch is not None:
         parts.append(f"最低丢弃 {pitch_name(s.min_dropped_pitch)}")
     if s.max_dropped_pitch is not None and s.max_dropped_pitch != s.min_dropped_pitch:

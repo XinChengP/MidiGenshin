@@ -22,7 +22,7 @@ from tests.make_test_midi import (  # noqa: E402
     tempo,
 )
 
-from genshin_lyre.exporter import export_script  # noqa: E402
+from genshin_lyre.exporter import export_script, parse_script  # noqa: E402
 from genshin_lyre.keys import KEYS, WIND_HORN, WIND_LYRE  # noqa: E402
 from genshin_lyre.mapper import (  # noqa: E402
     HOLD_FOLLOW,
@@ -390,6 +390,88 @@ def test_player_pause_stop():
     check("无按键残留", len(ups) >= len(downs) - 1, f"down={len(downs)} up={len(ups)}")
 
 
+# ---------------- 音轨筛选 / 黑键统计 / 回读 / 跳播 ----------------
+
+def test_track_filter():
+    # 三轨：0=旋律 1=低音 2=装饰音
+    trk0 = [tempo(0, 120)] + note(0, 480, 0, 60) + note(480, 480, 0, 62) + [eot(960)]
+    trk1 = note(0, 480, 1, 48) + [eot(480)]
+    trk2 = note(240, 240, 2, 76) + [eot(480)]
+    song = parse_midi(build_midi([trk0, trk1, trk2]))
+    check("音符带轨号", sorted({n.track for n in song.notes}) == [0, 1, 2],
+          str(sorted({n.track for n in song.notes})))
+    r = map_song(song, MapParams())
+    check("全轨 4 音符", r.stats.total == 4)
+    r = map_song(song, MapParams(), exclude_tracks={1, 2})
+    check("排除轨1+2 后 2 音符", r.stats.total == 2, str(r.stats.total))
+    check("排除后事件仅 A S", [e.combo for e in r.events] == ["A", "S"])
+    r = map_song(song, MapParams(), exclude_tracks=frozenset({0}))
+    check("排除轨0 后 2 音符", r.stats.total == 2)
+
+
+def test_blackkey_drop_stat():
+    song = _song_of([61, 60, 84])  # C#4(黑键), C4, C6(超音域)
+    r = map_song(song, MapParams(snap="drop"))
+    check("黑键丢弃独立计数", r.stats.dropped_blackkey == 1, str(r.stats.dropped_blackkey))
+    check("音域外仍计 dropped_range", r.stats.dropped_range == 1)
+    check("汇总 dropped=2", r.stats.dropped == 2)
+    # 吸附模式 blackkey=0
+    r = map_song(song, MapParams(snap="down"))
+    check("吸附模式黑键丢弃为 0", r.stats.dropped_blackkey == 0)
+
+
+def test_script_roundtrip(tmp="test_script.txt"):
+    # 导出 -> 回读 -> 事件一致
+    r = map_song(_song_of([60, 64, 67], dur=960), MapParams())
+    n = export_script(r, MapParams(), tmp, source_name="rt.mid")
+    _, r2, meta = parse_script(tmp)
+    check("回读事件数一致", len(r2.events) == len(r.events) == 4 or
+          len(r2.events) == len(r.events), f"{len(r2.events)} vs {len(r.events)}")
+    check("回读组合一致", [e.combo for e in r2.events] == [e.combo for e in r.events])
+    check("回读时间一致", [round(e.time, 3) for e in r2.events] ==
+          [round(e.time, 3) for e in r.events])
+    check("回读头部 source", meta["source"] == "rt.mid")
+    check("回读乐器头", meta["instrument"] == "原琴（三排）")
+    # 非法键名
+    with open(tmp, "wb") as f:
+        f.write("0.000\tZZZ\r\n".encode("utf-8"))
+    try:
+        parse_script(tmp)
+        check("非法键名拒绝", False)
+    except ValueError:
+        check("非法键名拒绝", True)
+    # 时间乱序
+    with open(tmp, "wb") as f:
+        f.write("1.000\tA\r\n0.500\tS\r\n".encode("utf-8"))
+    try:
+        parse_script(tmp)
+        check("时间乱序拒绝", False)
+    except ValueError:
+        check("时间乱序拒绝", True)
+    os.remove(tmp)
+
+
+def test_seek():
+    from genshin_lyre.mapper import LyreEvent, MappedKey
+    events = [LyreEvent(time=i * 0.08, keys=[MappedKey("A", 60, False)],
+                        releases=[0.060]) for i in range(120)]  # 9.6s
+    acts = build_actions(events, 1.0, "tap")
+    sender = KeySender(dry_run=True)
+    p = Player(acts, sender)
+    p.start()
+    time.sleep(0.4)          # 约 5 个事件
+    p.seek(60)               # 跳到事件 60（约 4.8s）
+    time.sleep(0.3)
+    p.stop()
+    p.join(timeout=5)
+    downs = [t for t, kind, _ in sender.log if kind == "down"]
+    after_seek = [t for t in downs if t > 0.4]
+    check("跳播后立即从新位置继续", after_seek and min(after_seek) < 0.75,
+          str([round(t, 2) for t in downs[-8:]]))
+    # 跳播地板：事件 60 之前的动作不再发送（统计事件 0-5 后 seek 前）
+    check("演奏线程正常结束", not p.is_alive())
+
+
 def main():
     test_keys()
     test_parse_basic()
@@ -412,6 +494,10 @@ def main():
     test_build_actions()
     test_player_timing()
     test_player_pause_stop()
+    test_track_filter()
+    test_blackkey_drop_stat()
+    test_script_roundtrip()
+    test_seek()
     print(f"\n全部通过：{PASS} 项检查")
 
 

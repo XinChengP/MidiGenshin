@@ -5,12 +5,16 @@ from __future__ import annotations
 import bisect
 import math
 import os
+import threading
 import time as _time
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRectF, Qt, QTimer, Signal, QSettings
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen, QIcon
+from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QToolButton,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -38,7 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import exporter
+from . import exporter, theme
 from .keys import INSTRUMENTS, WIND_HORN, WIND_LYRE, pitch_name
 from .mapper import (
     HOLD_FOLLOW,
@@ -53,14 +57,12 @@ from .mapper import (
     suggest_transpose,
 )
 from .midi_parser import MidiError, MidiSong, parse_midi
-from .player import KeySender, Player, build_actions, is_f8_pressed
+from .player import STOP_KEY_VKS, KeySender, Player, build_actions, is_stop_key_pressed
 
-VERSION = "v1.0"
-ACCENT = "#34B49F"
-CHORD_BG = QColor("#E9F7F4")
-CURSOR_BG = QColor("#FFEFC2")
-SNAP_FG = QColor("#B4761F")
-DROP_FG = QColor("#D64545")
+VERSION = "v1.1"
+REPO_URL = "https://github.com/XinChengP/MidiGenshin"
+ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "assets", "lyre.ico")
 
 
 def fmt_clock(t: float) -> str:
@@ -90,6 +92,13 @@ class EventTableModel(QAbstractTableModel):
         self._rows: list[tuple] = []
         self._times: list[float] = []
         self._cursor = -1  # 播放中的当前行
+        self._colors = theme.get_model_colors(False)
+
+    def set_palette(self, colors: dict[str, QColor]):
+        self._colors = colors
+        if self._rows:
+            self.dataChanged.emit(self.index(0, 0),
+                                  self.index(len(self._rows) - 1, len(self.HEADERS) - 1))
 
     def set_result(self, result: MapResult | None):
         self.beginResetModel()
@@ -147,11 +156,11 @@ class EventTableModel(QAbstractTableModel):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if role == Qt.ItemDataRole.BackgroundRole:
             if index.row() == self._cursor:
-                return CURSOR_BG
+                return self._colors["cursor_bg"]
             if row[5]:
-                return CHORD_BG
+                return self._colors["chord_bg"]
         if role == Qt.ItemDataRole.ForegroundRole and col == 4 and row[6]:
-            return SNAP_FG
+            return self._colors["snap_fg"]
         if role == Qt.ItemDataRole.FontRole and col == 2:
             f = QFont("Consolas")
             f.setBold(row[5])
@@ -160,6 +169,23 @@ class EventTableModel(QAbstractTableModel):
 
     def find_row_by_time(self, t: float) -> int:
         return max(0, bisect.bisect_right(self._times, t) - 1)
+
+
+class PreviewTable(QTableView):
+    """预览表格：Ctrl+C 复制选中行（时间<TAB>键1+键2）。"""
+
+    def keyPressEvent(self, event):
+        if (event.matches(event.StandardKey.Copy)
+                and self.selectionModel() and self.selectionModel().hasSelection()):
+            model = self.model()
+            rows = sorted({i.row() for i in self.selectionModel().selectedRows()})
+            lines = ["\t".join(str(model.index(r, c).data())
+                               for c in (1, 2)) for r in rows]
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText("\r\n".join(lines))
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 # ---------------- 键位分布条形图 ----------------
@@ -171,7 +197,14 @@ class KeyDistributionWidget(QWidget):
         super().__init__()
         self._data: list[tuple[str, int]] = []
         self._max = 1
+        self._colors = theme.get_model_colors(False)
+        self._pal = theme.get_palette(False)
         self.setMinimumHeight(24)
+
+    def set_palette(self, pal: dict, colors: dict):
+        self._pal = pal
+        self._colors = colors
+        self.update()
 
     def set_data(self, usage: dict[str, int]):
         self._data = sorted(usage.items(), key=lambda x: -x[1])
@@ -186,18 +219,18 @@ class KeyDistributionWidget(QWidget):
         p.setFont(QFont("Consolas", 9))
         y = 2
         for key, count in self._data:
-            p.setPen(QColor("#1F2329"))
+            p.setPen(QColor(self._pal["text"]))
             p.drawText(QRectF(0, y, 24, self.ROW_H - 2), Qt.AlignmentFlag.AlignVCenter, key)
             bar_w = max(2, (w - 100) * count / self._max)
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(ACCENT))
+            p.setBrush(QColor(self._pal["accent"]))
             p.drawRoundedRect(QRectF(28, y + 3, bar_w, self.ROW_H - 8), 2, 2)
-            p.setPen(QColor("#6B7280"))
+            p.setPen(QColor(self._pal["text2"]))
             p.drawText(QRectF(w - 66, y, 66, self.ROW_H - 2),
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, str(count))
             y += self.ROW_H
         if not self._data:
-            p.setPen(QColor("#9AA2AE"))
+            p.setPen(QColor(self._pal["text3"]))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "—")
 
 
@@ -207,10 +240,11 @@ class CountdownOverlay(QWidget):
     finished = Signal()
     cancelled = Signal()
 
-    def __init__(self, seconds: float):
+    def __init__(self, seconds: float, stop_key: str = "F8"):
         super().__init__(None, Qt.WindowType.FramelessWindowHint
                          | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._stop_key = stop_key
         self._deadline = _time.monotonic() + seconds
         self._last_shown = -1
 
@@ -226,7 +260,7 @@ class CountdownOverlay(QWidget):
         tip = QLabel("即将开始演奏 · 切换到游戏窗口")
         tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         tip.setStyleSheet("color: rgba(255,255,255,190); font-size: 13px;")
-        esc = QLabel("F8 / Esc 取消")
+        esc = QLabel(f"{stop_key} / Esc 取消")
         esc.setAlignment(Qt.AlignmentFlag.AlignCenter)
         esc.setStyleSheet("color: rgba(255,255,255,130); font-size: 12px;")
         card_lay.addWidget(self._num)
@@ -250,7 +284,7 @@ class CountdownOverlay(QWidget):
         self._tick()
 
     def _tick(self):
-        if is_f8_pressed():
+        if is_stop_key_pressed(STOP_KEY_VKS[self._stop_key]):
             self._done(False)
             return
         remain = self._deadline - _time.monotonic()
@@ -278,6 +312,36 @@ class CountdownOverlay(QWidget):
         p.setPen(QPen(QColor("#2AA68F"), 1))
         p.setBrush(QColor(24, 32, 36, 235))
         p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 16, 16)
+
+
+class ToastOverlay(QWidget):
+    """置顶小提示（如"演奏结束"），数秒后自动消失。"""
+
+    def __init__(self, text: str, seconds: float = 2.0):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint
+                         | Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel(text)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet(
+            "background: rgba(24,32,36,235); color: white; font-size: 16px; "
+            "font-weight: 600; padding: 18px 34px; border-radius: 12px; "
+            "border: 1px solid #2AA68F;")
+        lay.addWidget(lbl)
+        self._seconds = seconds
+
+    def show_toast(self):
+        geo = self.screen().availableGeometry()
+        self.adjustSize()
+        self.move(geo.center().x() - self.width() // 2,
+                  geo.center().y() - self.height() - 60)
+        self.show()
+        self.raise_()
+        QTimer.singleShot(int(self._seconds * 1000), self.close)
 
 
 # ---------------- 导出对话框 ----------------
@@ -359,13 +423,38 @@ class ExportDialog(QDialog):
 class MainWindow(QWidget):
     sig_progress = Signal(int)
     sig_state = Signal(str, str)
+    sig_suggest_done = Signal(int)
+
+    # ---- 主题 ----
+    def _apply_dark(self, dark: bool):
+        self._dark = dark
+        self._pal = theme.apply_theme(QApplication.instance(), dark)
+        self.model.set_palette(theme.get_model_colors(dark))
+        if hasattr(self, "_key_dist"):
+            self._key_dist.set_palette(self._pal, theme.get_model_colors(dark))
+        if hasattr(self, "_btn_dark"):
+            self._btn_dark.setText("☀" if dark else "🌙")
+            self._btn_dark.setToolTip("切换深色/浅色主题")
+
+    def _toggle_dark(self):
+        self._apply_dark(not self._dark)
+        self._settings.setValue("ui/dark", self._dark)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"原神原琴 MIDI 按键生成器  {VERSION}")
-        self.resize(1080, 720)
         self.setMinimumSize(960, 640)
         self.setAcceptDrops(True)
+        if os.path.exists(ICON_PATH):
+            self.setWindowIcon(QIcon(ICON_PATH))
+
+        self._settings = QSettings("XinChengP", "MidiGenshin")
+        self._dark = self._settings.value("ui/dark", False, type=bool)
+        geo = self._settings.value("ui/geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        else:
+            self.resize(1080, 720)
 
         self.song: MidiSong | None = None
         self.result: MapResult | None = None
@@ -373,10 +462,19 @@ class MainWindow(QWidget):
         self._overlay = None   # 持有倒计时浮窗引用，防止被 Python 回收
         self._playing = False
         self._paused = False
-        self._raw = b""
         self._path = ""
+        self.script_mode = False          # 回读 txt 脚本模式
+        self._excluded_tracks: set[int] = set()
+        self._last_scroll = 0.0           # 播放跟随滚动节流
+        self._rebuilding_tracks = False
+        self._suggest_thread = None
+        self._toast = None
+        self._library: list[dict] = []   # {"path","raw","name","song","parsed_drums"}
+        self._current_idx = -1
+        self._rebuilding_library = False
 
         self.model = EventTableModel()
+        self._apply_dark(self._dark)
         self._build_ui()
 
         self._remap_timer = QTimer(self)
@@ -386,6 +484,7 @@ class MainWindow(QWidget):
 
         self.sig_progress.connect(self._on_progress)
         self.sig_state.connect(self._on_player_state)
+        self.sig_suggest_done.connect(self._on_suggest_done)
         self._show_page(0)
 
     # ---------- UI 构建 ----------
@@ -401,6 +500,20 @@ class MainWindow(QWidget):
         status.setSizeGripEnabled(False)
         self._status_label = QLabel("就绪 · 将 .mid 文件拖入窗口开始")
         status.addWidget(self._status_label)
+        self._btn_dark = QToolButton()
+        self._btn_dark.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._btn_dark.setAutoRaise(True)
+        self._btn_dark.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_dark.clicked.connect(self._toggle_dark)
+        self._btn_dark.setText("☀" if self._dark else "🌙")
+        self._btn_dark.setToolTip("切换深色/浅色主题")
+        btn_about = QToolButton()
+        btn_about.setText("关于")
+        btn_about.setAutoRaise(True)
+        btn_about.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_about.clicked.connect(self._show_about)
+        status.addPermanentWidget(self._btn_dark)
+        status.addPermanentWidget(btn_about)
         self._status_right = QLabel(f"{VERSION} · 仅前台按键模拟 · 请勿用于违规用途")
         status.addPermanentWidget(self._status_right)
         # 嵌入到底部布局
@@ -419,7 +532,7 @@ class MainWindow(QWidget):
         icon = QLabel("♪")
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon.setStyleSheet("font-size: 52px; color: #34B49F;")
-        t1 = QLabel("将 .mid / .midi 拖到此处")
+        t1 = QLabel("将 .mid / .midi 拖到此处（支持多选与整个文件夹）")
         t1.setAlignment(Qt.AlignmentFlag.AlignCenter)
         t1.setStyleSheet("font-size: 18px; font-weight: 600; color: #1F2329;")
         t2 = QLabel("或 点击选择文件")
@@ -457,19 +570,45 @@ class MainWindow(QWidget):
         bar.setObjectName("card")
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(8)
         self._info_icon = QLabel("♪")
-        self._info_icon.setStyleSheet(f"color: {ACCENT}; font-size: 18px;")
-        self._info_name = QLabel("未加载文件")
-        self._info_name.setStyleSheet("font-weight: 600;")
+        self._info_icon.setStyleSheet("color: palette(highlight); font-size: 18px;")
+
+        self.cmb_library = QComboBox()
+        self.cmb_library.setMinimumWidth(200)
+        self.cmb_library.setMaxVisibleItems(24)
+        self.cmb_library.setToolTip("曲库：选择要处理的 MIDI（切换即重算）")
+        self.cmb_library.currentIndexChanged.connect(self._on_library_changed)
+        self.btn_prev = QPushButton("◀")
+        self.btn_prev.setFixedWidth(32)
+        self.btn_prev.setToolTip("上一曲（Ctrl+←）")
+        self.btn_next = QPushButton("▶")
+        self.btn_next.setFixedWidth(32)
+        self.btn_next.setToolTip("下一曲（Ctrl+→）")
+        self.btn_prev.clicked.connect(lambda: self._step_library(-1))
+        self.btn_next.clicked.connect(lambda: self._step_library(1))
+        self.btn_remove = QPushButton("✕")
+        self.btn_remove.setFixedWidth(32)
+        self.btn_remove.setToolTip("从曲库移除当前曲目")
+        self.btn_remove.clicked.connect(self._remove_current)
+
         self._info_detail = QLabel("")
         self._info_detail.setStyleSheet("color: #6B7280;")
-        btn = QPushButton("更换文件")
-        btn.clicked.connect(self._open_file_dialog)
+
+        self.btn_add_files = QPushButton("添加文件")
+        self.btn_add_files.clicked.connect(self._add_files_dialog)
+        self.btn_add_dir = QPushButton("添加文件夹")
+        self.btn_add_dir.clicked.connect(self._add_dir_dialog)
+
         lay.addWidget(self._info_icon)
-        lay.addWidget(self._info_name)
-        lay.addSpacing(10)
-        lay.addWidget(self._info_detail, 1)
-        lay.addWidget(btn)
+        lay.addWidget(self.cmb_library, 1)
+        lay.addWidget(self.btn_prev)
+        lay.addWidget(self.btn_next)
+        lay.addWidget(self.btn_remove)
+        lay.addSpacing(8)
+        lay.addWidget(self._info_detail, 2)
+        lay.addWidget(self.btn_add_files)
+        lay.addWidget(self.btn_add_dir)
         return bar
 
     def _build_params(self) -> QFrame:
@@ -585,7 +724,7 @@ class MainWindow(QWidget):
         tools.addStretch(1)
         lay.addLayout(tools)
 
-        self.table = QTableView()
+        self.table = PreviewTable()
         self.table.setModel(self.model)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -644,6 +783,15 @@ class MainWindow(QWidget):
         self._lbl_drop_detail.setStyleSheet("color: #6B7280; font-size: 12px;")
         ov.addWidget(self._lbl_drop_detail)
 
+        _, trk = card("音轨筛选")
+        self._tracks_box = QVBoxLayout()
+        self._tracks_box.setSpacing(2)
+        trk.addLayout(self._tracks_box)
+        self._lbl_tracks_hint = QLabel("")
+        self._lbl_tracks_hint.setStyleSheet("color: #9AA2AE; font-size: 11px;")
+        self._lbl_tracks_hint.setWordWrap(True)
+        trk.addWidget(self._lbl_tracks_hint)
+
         _, kd = card("键位分布")
         self._key_dist = KeyDistributionWidget()
         kd.addWidget(self._key_dist)
@@ -695,19 +843,27 @@ class MainWindow(QWidget):
         self.cmb_countdown.setCurrentIndex(2)
         lay.addWidget(self.cmb_countdown)
 
+        lay.addWidget(QLabel("急停键"))
+        self.cmb_stopkey = QComboBox()
+        for name in STOP_KEY_VKS:
+            self.cmb_stopkey.addItem(name, STOP_KEY_VKS[name])
+        self.cmb_stopkey.setCurrentIndex(0)
+        self.cmb_stopkey.currentIndexChanged.connect(self._on_stopkey_changed)
+        lay.addWidget(self.cmb_stopkey)
+
         self.sld_progress = QSlider(Qt.Orientation.Horizontal)
         self.sld_progress.setRange(0, 0)
         self.sld_progress.setEnabled(False)
-        self.sld_progress.setStyleSheet(f"QSlider::groove:horizontal {{ height: 6px; border-radius: 3px; background: #E3E6EB; }}"
-                                        f"QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 3px; }}")
+        self.sld_progress.setTracking(False)  # 拖动中不触发，松手才跳播
+        self.sld_progress.sliderReleased.connect(self._on_seek_released)
         lay.addWidget(self.sld_progress, 1)
         self.lbl_progress = QLabel("0/0")
         self.lbl_progress.setStyleSheet("color: #6B7280;")
         lay.addWidget(self.lbl_progress)
 
-        hint = QLabel("F8 急停")
-        hint.setStyleSheet("color: #D64545; font-weight: 600;")
-        lay.addWidget(hint)
+        self.lbl_stopkey = QLabel("F8 急停")
+        self.lbl_stopkey.setStyleSheet("color: #D64545; font-weight: 600;")
+        lay.addWidget(self.lbl_stopkey)
 
         self.btn_export = QPushButton("导出 txt")
         self.btn_export.setObjectName("accentBtn")
@@ -720,7 +876,8 @@ class MainWindow(QWidget):
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
-                if url.toLocalFile().lower().endswith((".mid", ".midi")):
+                lp = url.toLocalFile()
+                if lp.lower().endswith((".mid", ".midi", ".txt")) or os.path.isdir(lp):
                     event.acceptProposedAction()
                     self._set_drag_over(True)
                     return
@@ -731,11 +888,15 @@ class MainWindow(QWidget):
 
     def dropEvent(self, event):
         self._set_drag_over(False)
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path.lower().endswith((".mid", ".midi")):
-                self.load_file(path)
-                break
+        paths = [u.toLocalFile() for u in event.mimeData().urls()]
+        txts = [p for p in paths if p.lower().endswith(".txt")]
+        if txts:
+            self._load_script(txts[0])
+            return
+        if self.player:
+            self._on_stop()
+        added, errors = self._add_paths(paths)
+        self._import_finish(added, errors, prefer=paths[0] if len(paths) == 1 else None)
 
     def _set_drag_over(self, on: bool):
         self.drop_zone.setProperty("dragOver", "true" if on else "false")
@@ -743,46 +904,232 @@ class MainWindow(QWidget):
         self.drop_zone.style().polish(self.drop_zone)
 
     def _open_file_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开 MIDI 文件", "",
-                                              "MIDI 文件 (*.mid *.midi)")
-        if path:
-            self.load_file(path)
+        self._add_files_dialog()
+
+    def _add_files_dialog(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "添加 MIDI 文件", "",
+                                                "MIDI 文件 (*.mid *.midi)")
+        if not paths:
+            return
+        if self.player:
+            self._on_stop()
+        added, errors = self._add_paths(paths)
+        self._import_finish(added, errors)
+
+    def _add_dir_dialog(self):
+        d = QFileDialog.getExistingDirectory(self, "添加文件夹（递归扫描其中的 MIDI）")
+        if not d:
+            return
+        if self.player:
+            self._on_stop()
+        added, errors = self._add_paths([d])
+        self._import_finish(added, errors)
 
     def load_file(self, path: str):
+        """加载并切换到指定 MIDI；已在曲库中则直接切换。"""
+        if path.lower().endswith(".txt"):
+            self._load_script(path)
+            return
+        if self.player:
+            self._on_stop()
+        apath = os.path.abspath(path)
+        for i, e in enumerate(self._library):
+            if os.path.abspath(e["path"]) == apath:
+                self._switch_current(i)
+                return
+        added, errors = self._add_paths([path])
+        if errors:
+            self._show_load_error(errors[0])
+            return
+        if added:
+            self._switch_current(added[0])
+
+    # ---- 曲库管理 ----
+    def _iter_midi_files(self, paths):
+        """展开目录（递归）并过滤出 MIDI 文件。"""
+        files = []
+        for p in paths:
+            if os.path.isdir(p):
+                for root, _dirs, names in os.walk(p):
+                    for n in sorted(names):
+                        if n.lower().endswith((".mid", ".midi")):
+                            files.append(os.path.join(root, n))
+            elif p.lower().endswith((".mid", ".midi")):
+                files.append(p)
+        return files
+
+    def _add_paths(self, paths):
+        """批量解析并加入曲库。返回 (新增条目索引列表, 错误列表)。"""
+        files = self._iter_midi_files(paths)
+        errors = []
+        added = []
+        if not files:
+            return added, (["未找到 .mid / .midi 文件"] if paths else [])
+        existing = {os.path.abspath(e["path"]) for e in self._library}
+        names = {e["name"] for e in self._library}
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            with open(path, "rb") as f:
-                data = f.read()
-            self._raw = data
-            self._path = path
-            song = parse_midi(data, filepath=path, include_drums=self.chk_drums.isChecked())
-        except MidiError as e:
-            self._show_load_error(str(e))
+            for fp in files:
+                ap = os.path.abspath(fp)
+                if ap in existing:
+                    continue
+                try:
+                    with open(fp, "rb") as f:
+                        raw = f.read()
+                    song = parse_midi(raw, filepath=fp,
+                                      include_drums=self.chk_drums.isChecked())
+                except (MidiError, OSError) as e:
+                    errors.append(f"{os.path.basename(fp)}：{e}")
+                    continue
+                name = os.path.basename(fp)
+                if name in names:  # 重名曲目标注所在文件夹
+                    stem = os.path.splitext(name)[0]
+                    folder = os.path.basename(os.path.dirname(fp))
+                    name = f"{stem} · {folder}" if folder else name
+                names.add(name)
+                self._library.append({"path": fp, "raw": raw, "name": name,
+                                      "song": song,
+                                      "parsed_drums": self.chk_drums.isChecked()})
+                existing.add(ap)
+                added.append(len(self._library) - 1)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if added:
+            self.script_mode = False
+            self._excluded_tracks = set()
+            self._show_page(1)
+            self._set_script_ui(False)
+            self._update_library_combo()
+        return added, errors
+
+    def _import_finish(self, added, errors, prefer=None):
+        """批量导入后的收尾：选择目标曲目并汇报结果。"""
+        if prefer:
+            ap = os.path.abspath(prefer)
+            for i, e in enumerate(self._library):
+                if os.path.abspath(e["path"]) == ap:
+                    added = [i] + [x for x in added if x != i]
+                    break
+        if added:
+            self._switch_current(added[0])
+        msg = f"已添加 {len(added)} 首 · 曲库共 {len(self._library)} 首"
+        if errors:
+            msg += f" · 失败 {len(errors)}：{errors[0]}"
+            if len(errors) > 1:
+                msg += " 等"
+        self._set_status(msg)
+
+    def _entry_song(self, entry):
+        """取条目曲目（含打击乐开关的解析缓存）。"""
+        drums = self.chk_drums.isChecked()
+        if entry["song"] is None or entry["parsed_drums"] != drums:
+            entry["song"] = parse_midi(entry["raw"], filepath=entry["path"],
+                                       include_drums=drums)
+            entry["parsed_drums"] = drums
+        return entry["song"]
+
+    def _switch_current(self, idx):
+        if not (0 <= idx < len(self._library)):
             return
-        except OSError as e:
-            self._show_load_error(f"无法读取文件：{e}")
-            return
-        self.song = song
+        self._current_idx = idx
+        entry = self._library[idx]
+        self.song = self._entry_song(entry)
+        self._path = entry["path"]
+        self.script_mode = False
+        self._excluded_tracks = set()
         self._show_page(1)
+        self._set_script_ui(False)
+        self._update_library_combo()
         self._update_info_bar()
         self._remap()
-        self._set_status(f"已加载 {song.filename} · {len(song.notes)} 音符 · "
-                         f"{len(song.tempo_changes)} 处 BPM 节点")
+        self._set_status(f"已切换到 {entry['name']} · {len(self.song.notes)} 音符")
+
+    def _on_library_changed(self, idx):
+        if self._rebuilding_library or idx == self._current_idx or idx < 0:
+            return
+        if self.player:
+            self._on_stop()
+        self._switch_current(idx)
+
+    def _step_library(self, step):
+        if len(self._library) < 2:
+            return
+        self._switch_current((self._current_idx + step) % len(self._library))
+
+    def _remove_current(self):
+        if not self._library:
+            return
+        if self.player:
+            self._on_stop()
+        del self._library[self._current_idx]
+        if not self._library:
+            self._current_idx = -1
+            self.song = None
+            self.result = None
+            self._update_library_combo()
+            self._show_page(0)
+            self._set_status("曲库已清空 · 将 .mid 文件拖入窗口开始")
+            return
+        self._switch_current(min(self._current_idx, len(self._library) - 1))
+
+    def _update_library_combo(self):
+        self._rebuilding_library = True
+        self.cmb_library.clear()
+        for i, e in enumerate(self._library):
+            self.cmb_library.addItem(e["name"], i)
+        if 0 <= self._current_idx < len(self._library):
+            self.cmb_library.setCurrentIndex(self._current_idx)
+        multi = len(self._library) > 1
+        for w in (self.btn_prev, self.btn_next, self.btn_remove):
+            w.setEnabled(multi)
+        self._rebuilding_library = False
+
+    def _load_script(self, path: str):
+        """回读导出的 txt 时序脚本（可再预览与播放）。"""
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                _, result, meta = exporter.parse_script(path)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except (ValueError, OSError) as e:
+            self._show_load_error(f"无法读取脚本：{e}")
+            return
+        self.song = None
+        self.script_mode = True
+        self._path = path
+        self.result = result
+        self._show_page(1)
+        name = path.replace("\\", "/").rsplit("/", 1)[-1]
+        self._info_detail.setText(f"时序脚本 · {len(result.events)} 事件"
+                                  + (f" · 来源 {meta['source']}" if meta["source"] else ""))
+        self._set_script_ui(True)
+        self._apply_result()
+        self._set_status(f"已导入脚本 {name} · {len(result.events)} 事件 · 可直接播放")
+
+    def _set_script_ui(self, script: bool):
+        """脚本模式下禁用与 MIDI 解析相关的参数，并隐藏曲目导航。"""
+        for w in (self.cmb_library, self.btn_prev, self.btn_next, self.btn_remove):
+            w.setVisible(not script)
+        for w in (self.cmb_instrument, self.spin_transpose, self.btn_suggest,
+                  self.cmb_snap, self.sld_tol, self.chk_drums):
+            w.setEnabled(not script and not self._playing)
 
     def _show_load_error(self, msg: str):
-        self._info_name.setText("加载失败")
-        self._info_name.setStyleSheet("font-weight: 600; color: #D64545;")
-        self._info_detail.setText(msg)
+        self._info_detail.setText("加载失败：" + msg)
         self._set_status("加载失败")
         QMessageBox.warning(self, "无法加载 MIDI", msg)
-        self._info_name.setStyleSheet("font-weight: 600;")
 
     def _update_info_bar(self):
         s = self.song
-        self._info_name.setText(s.filename)
-        self._info_detail.setText(
-            f"{fmt_clock(s.duration)} · {s.track_count} 轨 · {len(s.notes)} 音符 · "
-            f"BPM {s.bpm_display:g}" + (f"（{len(s.tempo_changes)} 处变速）"
-                                        if len(s.tempo_changes) > 1 else ""))
+        if not s:
+            return
+        detail = (f"{fmt_clock(s.duration)} · {s.track_count} 轨 · {len(s.notes)} 音符 · "
+                  f"BPM {s.bpm_display:g}"
+                  + (f"（{len(s.tempo_changes)} 处变速）" if len(s.tempo_changes) > 1 else ""))
+        if len(self._library) > 1:
+            detail += f" · 曲库 {len(self._library)} 首"
+        self._info_detail.setText(detail)
 
     # ---------- 映射与刷新 ----------
     def _current_params(self) -> MapParams:
@@ -807,19 +1154,24 @@ class MainWindow(QWidget):
         self._update_params_summary()
 
     def _on_drums_toggled(self):
-        if hasattr(self, "_raw") and self.song:
-            try:
-                self.song = parse_midi(self._raw, filepath=self._path,
-                                       include_drums=self.chk_drums.isChecked())
-                self._update_info_bar()
-            except MidiError as e:
-                self._set_status(f"重新解析失败：{e}")
+        for e in self._library:
+            e["parsed_drums"] = None  # 缓存失效，切换/重算时按新开关重解析
+        if self.song is not None and 0 <= self._current_idx < len(self._library):
+            self.song = self._entry_song(self._library[self._current_idx])
+            self._update_info_bar()
         self._schedule_remap()
 
     def _remap(self):
+        if self.script_mode:
+            return  # 脚本模式无参数可重算
         if not self.song:
             return
-        self.result = map_song(self.song, self._current_params())
+        self.result = map_song(self.song, self._current_params(),
+                               exclude_tracks=frozenset(self._excluded_tracks))
+        self._apply_result()
+
+    def _apply_result(self):
+        """把 self.result 应用到列表/统计/按钮（MIDI 与脚本模式共用）。"""
         self.model.set_result(self.result)
         self.sld_progress.setRange(0, max(0, len(self.result.events) - 1))
         self.sld_progress.setValue(0)
@@ -846,11 +1198,15 @@ class MainWindow(QWidget):
         self._lbl_drop_detail.setText(dropped_summary(self.result) if s.total else "")
         self._key_dist.set_data(self.result.key_usage)
 
-        tc = self.song.tempo_changes
+        tc = self.song.tempo_changes if self.song else []
         self._bpm_table.setRowCount(len(tc))
         for i, t in enumerate(tc):
             self._bpm_table.setItem(i, 0, QTableWidgetItem(fmt_clock(t.time)))
             self._bpm_table.setItem(i, 1, QTableWidgetItem(f"{t.bpm:.1f}"))
+        if not self.song:
+            self._bpm_table.setRowCount(1)
+            self._bpm_table.setItem(0, 0, QTableWidgetItem("—"))
+            self._bpm_table.setItem(0, 1, QTableWidgetItem("脚本无 BPM"))
 
         inst = self._current_params().instrument
         ref_lines = [f"{label}  {' '.join(row)}"
@@ -858,8 +1214,44 @@ class MainWindow(QWidget):
         span = "低/中/高三组" if len(inst.rows) == 3 else "中/高两组"
         ref_lines.append(f"C 大调 {span} do–si（MIDI {inst.pitch_min}–{inst.pitch_max}）")
         self._lbl_key_ref.setText("\n".join(ref_lines))
+        self._update_track_card()
+
+    def _update_track_card(self):
+        """重建音轨筛选复选框（脚本模式清空）。"""
+        self._rebuilding_tracks = True
+        while self._tracks_box.count():
+            item = self._tracks_box.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        if not self.song:
+            self._lbl_tracks_hint.setText("（脚本模式无音轨）")
+            self._rebuilding_tracks = False
+            return
+        counts: dict[int, int] = {}
+        for n in self.song.notes:
+            counts[n.track] = counts.get(n.track, 0) + 1
+        for trk in sorted(counts):
+            cb = QCheckBox(f"轨 {trk + 1} · {counts[trk]} 音符")
+            cb.setChecked(trk not in self._excluded_tracks)
+            cb.toggled.connect(lambda on, t=trk: self._on_track_toggled(t, on))
+            self._tracks_box.addWidget(cb)
+        self._lbl_tracks_hint.setText("取消勾选的音轨不参与映射" if len(counts) > 1 else "")
+        self._rebuilding_tracks = False
+
+    def _on_track_toggled(self, track: int, on: bool):
+        if self._rebuilding_tracks:
+            return
+        if on:
+            self._excluded_tracks.discard(track)
+        else:
+            self._excluded_tracks.add(track)
+        self._schedule_remap()
 
     def _update_params_summary(self):
+        if self.script_mode:
+            self._params_summary.setText("时序脚本 · 按键模式与演奏速度可调")
+            return
         p = self._current_params()
         snap_txt = self.cmb_snap.currentText().split(" ")[0]
         self._params_summary.setText(
@@ -873,11 +1265,27 @@ class MainWindow(QWidget):
         self._params_toggle.setText("参数 ▾" if show else "参数 ▸")
 
     def _suggest_transpose(self):
-        if not self.song:
+        if not self.song or self._suggest_thread:
             return
-        best = suggest_transpose(self.song, self._current_params())
-        self.spin_transpose.setValue(best)
-        self._set_status(f"已应用移调建议：{best:+d} 半音（丢弃数最少）")
+        song, params = self.song, self._current_params()
+        self.btn_suggest.setEnabled(False)
+        self.btn_suggest.setText("计算中…")
+        self._set_status("正在计算移调建议…")
+
+        def work():
+            best = suggest_transpose(song, params)
+            self.sig_suggest_done.emit(best)
+
+        self._suggest_thread = threading.Thread(target=work, daemon=True)
+        self._suggest_thread.start()
+
+    def _on_suggest_done(self, best: int):
+        self._suggest_thread = None
+        self.btn_suggest.setEnabled(bool(self.song) and not self._playing)
+        self.btn_suggest.setText("智能移调建议")
+        if self.song:
+            self.spin_transpose.setValue(best)
+            self._set_status(f"已应用移调建议：{best:+d} 半音（丢弃数最少）")
 
     def _jump_to_time(self):
         t = parse_time_text(self.edit_jump.text())
@@ -898,7 +1306,7 @@ class MainWindow(QWidget):
         if secs <= 0:
             self._start_playback()
         else:
-            ov = CountdownOverlay(float(secs))
+            ov = CountdownOverlay(float(secs), self.cmb_stopkey.currentText())
             ov.finished.connect(self._start_playback)
             ov.cancelled.connect(self._on_countdown_cancelled)
             self._overlay = ov   # 必须持有引用，否则离开函数即被销毁
@@ -921,6 +1329,7 @@ class MainWindow(QWidget):
             on_progress=lambda idx: self.sig_progress.emit(idx),
             on_state=lambda s, d: self.sig_state.emit(s, d),
             focus_guard_hwnd=int(self.winId()),
+            stop_vk=self.cmb_stopkey.currentData(),
         )
         self._playing = True
         self._paused = False
@@ -947,7 +1356,9 @@ class MainWindow(QWidget):
         self.sld_progress.setValue(idx)
         self.lbl_progress.setText(f"{idx + 1}/{len(self.result.events) if self.result else 0}")
         self.model.set_cursor(idx)
-        if self.chk_follow.isChecked():
+        now = _time.monotonic()
+        if self.chk_follow.isChecked() and now - self._last_scroll >= 0.03:
+            self._last_scroll = now
             self.table.selectRow(idx)
             self.table.scrollTo(self.model.index(idx, 0),
                                 QAbstractItemView.ScrollHint.PositionAtCenter)
@@ -987,32 +1398,70 @@ class MainWindow(QWidget):
         self._set_playing_ui(False)
         self.model.set_cursor(-1)
         self._set_status(msg)
+        if msg == "演奏结束":
+            self._toast = ToastOverlay("♪ 演奏结束")
+            self._toast.show_toast()
 
     def _set_playing_ui(self, playing: bool):
         self.btn_play.setEnabled(not playing and bool(self.result and self.result.events))
         self.btn_pause.setEnabled(playing)
         self.btn_stop.setEnabled(playing)
         self.btn_export.setEnabled(not playing and bool(self.result and self.result.events))
-        for w in (self.cmb_instrument, self.spin_transpose, self.btn_suggest,
-                  self.cmb_snap, self.sld_tol, self.cmb_hold, self.sld_speed,
-                  self.chk_drums):
-            w.setEnabled(not playing)
+        self._set_script_ui(self.script_mode)
+        self.cmb_hold.setEnabled(not playing)
+        self.sld_speed.setEnabled(not playing)
+        self.cmb_stopkey.setEnabled(not playing)
         self.sld_progress.setEnabled(playing)
+
+    def _on_stopkey_changed(self):
+        name = self.cmb_stopkey.currentText()
+        self.lbl_stopkey.setText(f"{name} 急停")
+
+    def _on_seek_released(self):
+        """进度条跳播：跳到滑块所在事件继续演奏。"""
+        if not (self.player and self.result and self._playing):
+            return
+        idx = self.sld_progress.value()
+        self.player.seek(idx)
+        self.model.set_cursor(idx)
+        row = self.model.index(idx, 0)
+        self.table.scrollTo(row, QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    def _show_about(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("关于")
+        box.setText(
+            f"<b>原神原琴 MIDI 按键生成器 {VERSION}</b><br><br>"
+            "读取 MIDI，转换为原琴按键时序并自动演奏。<br>"
+            f"项目主页：<a href='{REPO_URL}'>{REPO_URL}</a><br><br>"
+            "仅前台按键模拟，不含任何注入或反检测设计。<br>"
+            "自动化输入可能违反游戏用户协议，仅供单机/离线练习，风险自负。")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.exec()
 
     # ---------- 导出 ----------
     def _on_export(self):
         if not self.result:
             return
-        stem = (self.song.filename or "output").rsplit(".", 1)[0]
+        if self.song:
+            stem = (self.song.filename or "output").rsplit(".", 1)[0]
+        else:
+            stem = (self._path.replace("\\", "/").rsplit("/", 1)[-1] or "output")
+            if stem.endswith(".txt"):
+                stem = stem[:-4]
         folder = os.path.dirname(self._path) if self._path else ""
         default = os.path.join(folder or ".", stem + "_原琴.txt")
         dlg = ExportDialog(self, default)
         if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.path:
             return
         try:
+            if self.song:
+                source = self.song.filename
+            else:
+                source = self._path.replace("\\", "/").rsplit("/", 1)[-1]
             n = exporter.export_script(
                 self.result, self._current_params(), dlg.path,
-                source_name=self.song.filename,
+                source_name=source,
                 include_header=dlg.include_header,
                 clock_format=dlg.clock_format,
                 speed=self.speed if dlg.scale_by_speed else 1.0,
@@ -1034,14 +1483,20 @@ class MainWindow(QWidget):
         if key == Qt.Key.Key_Escape and self._playing:
             self._on_stop()
         elif ctrl and key == Qt.Key.Key_O:
-            self._open_file_dialog()
+            self._add_files_dialog()
+        elif ctrl and key == Qt.Key.Key_Left:
+            self._step_library(-1)
+        elif ctrl and key == Qt.Key.Key_Right:
+            self._step_library(1)
         elif ctrl and key == Qt.Key.Key_S:
             self._on_export()
         else:
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        self._settings.setValue("ui/geometry", self.saveGeometry())
         if self.player:
             self.player.stop()
+            self.player.join(timeout=1.0)  # 等线程释放按键，避免残留卡键
             self.player = None
         super().closeEvent(event)
