@@ -1,0 +1,46 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install PySide6 pyinstaller
+
+      - name: Build exe
+        shell: pwsh
+        run: |
+          $excl = @("QtNetwork","QtQml","QtQuick","QtQuickWidgets","QtSvg","QtSvgWidgets",
+            "QtPdf","QtPdfWidgets","QtMultimedia","QtMultimediaWidgets","QtSql","QtTest",
+            "QtXml","QtOpenGL","QtOpenGLWidgets","Qt3DCore","Qt3DRender","QtCharts",
+            "QtSerialPort","QtBluetooth","QtWebSockets","QtWebChannel","QtPositioning",
+            "QtSensors","QtWebEngineCore","QtWebEngineWidgets","QtTextToSpeech",
+            "QtRemoteObjects","QtScxml","QtStateMachine","QtDesigner","QtHelp",
+            "QtUiTools","QtAxContainer") | ForEach-Object { "--exclude-module", "PySide6.$_" }
+          python -m PyInstaller --noconfirm --onefile --windowed --name MidiGenshin `
+            --icon assets/lyre.ico --add-data "assets;assets" @excl run.py
+
+      - name: Upload release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" "dist/MidiGenshin.exe" `
+            --title "$env:GITHUB_REF_NAME" --generate-notes 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release upload "$env:GITHUB_REF_NAME" "dist/MidiGenshin.exe" --clobber
+          }

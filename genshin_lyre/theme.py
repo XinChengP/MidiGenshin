@@ -32,10 +32,10 @@ PALETTES: dict[str, dict[str, str]] = {
 
 # 预览列表 / 统计等由代码绘制处使用的颜色
 MODEL_COLORS: dict[str, dict[str, str]] = {
-    "light": {"chord_bg": "#E9F7F4", "cursor_bg": "#FFEFC2", "snap_fg": "#B4761F",
-              "drop_fg": "#D64545", "drop_num_fg": "#D64545"},
-    "dark": {"chord_bg": "#1F3B36", "cursor_bg": "#4A3F1E", "snap_fg": "#E8A33D",
-             "drop_fg": "#FF8A8A", "drop_num_fg": "#FF8A8A"},
+    "light": {"chord_bg": "#E9F7F4", "cursor_bg": "#FFEFC2", "start_bg": "#FFDFA6",
+              "snap_fg": "#B4761F", "drop_fg": "#D64545", "drop_num_fg": "#D64545"},
+    "dark": {"chord_bg": "#1F3B36", "cursor_bg": "#4A3F1E", "start_bg": "#5A451C",
+             "snap_fg": "#E8A33D", "drop_fg": "#FF8A8A", "drop_num_fg": "#FF8A8A"},
 }
 
 

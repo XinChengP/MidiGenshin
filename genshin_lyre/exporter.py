@@ -28,6 +28,7 @@ def export_script(
     include_header: bool = True,
     clock_format: bool = False,   # False: 秒；True: 分:秒.毫秒
     speed: float = 1.0,           # >1 表示更快，时间等比缩短
+    include_durations: bool = False,  # v2：附加保持时长列，回读可“跟随音符”
 ) -> int:
     """写出到 path，返回事件行数。"""
     if speed <= 0:
@@ -37,8 +38,9 @@ def export_script(
     if include_header:
         s = result.stats
         snap = {"down": "snap-down", "up": "snap-up", "drop": "drop"}[params.snap]
+        version = "genshin-lyre-script v2" if include_durations else FORMAT_VERSION
         lines += [
-            f"# {FORMAT_VERSION}",
+            f"# {version}",
             f"# source={source_name}" if source_name else "# source=",
             f"# instrument={params.instrument.name}",
             f"# duration={_fmt_sec(max((e.time for e in result.events), default=0.0))}s",
@@ -48,7 +50,11 @@ def export_script(
         ]
     for e in result.events:
         t = e.time / speed
-        lines.append(f"{fmt(t)}\t{e.combo}")
+        row = f"{fmt(t)}\t{e.combo}"
+        if include_durations:
+            hold = e.hold if params.hold_mode == "tap" else e.hold / speed
+            row += f"\t{hold:.3f}"
+        lines.append(row)
     data = ("\r\n".join(lines) + "\r\n").encode("utf-8")
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "wb") as f:
@@ -75,12 +81,14 @@ def parse_script(path: str) -> tuple[list, "MapResult", dict]:
     时间相对首个事件，保持文件中的数值；无音符时长信息（按短按演奏）。
     """
     from .keys import KEYS
-    from .mapper import LyreEvent, MappedKey, MapResult, MapStats
+    from .mapper import (MAX_HOLD, MIN_HOLD, LyreEvent, MappedKey,
+                         MapResult, MapStats)
 
     with open(path, "rb") as f:
         text = f.read().decode("utf-8")
 
-    meta: dict = {"source": "", "instrument": "", "transpose": None}
+    meta: dict = {"source": "", "instrument": "", "transpose": None,
+                  "version": "v1", "has_durations": False}
     events = []
     last_t = -1.0
     for lineno, line in enumerate(text.splitlines(), 1):
@@ -88,8 +96,12 @@ def parse_script(path: str) -> tuple[list, "MapResult", dict]:
         if not line:
             continue
         if line.startswith("#"):
-            for part in line[1:].split():
-                if part.startswith("source="):
+            tokens = line[1:].split()
+            for ti, part in enumerate(tokens):
+                if part == "genshin-lyre-script" and ti + 1 < len(tokens):
+                    meta["version"] = tokens[ti + 1]
+                    meta["has_durations"] = meta["version"] >= "v2"
+                elif part.startswith("source="):
                     meta["source"] = part[7:]
                 elif part.startswith("instrument="):
                     meta["instrument"] = part[11:]
@@ -99,11 +111,15 @@ def parse_script(path: str) -> tuple[list, "MapResult", dict]:
                     except ValueError:
                         pass
             continue
+        parts = line.split("\t")
         try:
-            t_str, combo = line.split("\t", 1)
+            t_str, combo = parts[0], parts[1]
             t = float(t_str)
-        except ValueError:
+            hold = float(parts[2]) if len(parts) > 2 else None
+        except (ValueError, IndexError):
             raise ValueError(f"脚本第 {lineno} 行格式无效：{line[:40]!r}")
+        if hold is not None:
+            hold = min(max(hold, MIN_HOLD), MAX_HOLD)
         keys = []
         for name in combo.split("+"):
             k = KEYS.get(name)
@@ -116,7 +132,8 @@ def parse_script(path: str) -> tuple[list, "MapResult", dict]:
         last_t = t
         mk = [MappedKey(n, KEYS[n].midi_pitch, False) for n in
               sorted(keys, key=lambda n: KEYS[n].midi_pitch)]
-        events.append(LyreEvent(time=t, keys=mk, releases=[TAP_HOLD] * len(mk)))
+        events.append(LyreEvent(time=t, keys=mk,
+                                releases=[hold if hold is not None else TAP_HOLD] * len(mk)))
 
     stats = MapStats(total=sum(len(e.keys) for e in events),
                      direct=sum(len(e.keys) for e in events))

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from dataclasses import replace
+
 from .keys import (
     Instrument,
+    WIND_HORN,
     WIND_LYRE,
     is_black_key,
     pitch_name,
@@ -30,7 +33,7 @@ class MapParams:
     transpose: int = 0          # 半音，-12..+12
     snap: str = SNAP_DOWN       # down / up / drop
     chord_tol: float = 0.020    # 和弦合并容差（秒）
-    hold_mode: str = HOLD_TAP   # tap / follow
+    hold_mode: str = HOLD_FOLLOW  # tap / follow（默认跟随音符时长）
 
     def validate(self) -> "MapParams":
         if self.instrument is None:
@@ -180,6 +183,32 @@ def map_song(song: MidiSong, params: MapParams,
 
     stats.chord_groups = sum(1 for e in events if e.is_chord)
     return MapResult(events=events, stats=stats, key_usage=key_usage)
+
+
+def auto_adjust(song: MidiSong, params: MapParams) -> tuple[Instrument, int]:
+    """按曲目自动选择乐器与移调。
+
+    规则：音域跨度在两个八度（24 半音）以内时优先满足原琴·两排；
+    两排最佳方案的丢弃数不劣于三排时采用二排，否则用三排。
+    返回 (乐器, 移调半音数)。
+    """
+    notes = song.notes
+    if not notes:
+        return WIND_LYRE, 0
+    span = max(n.pitch for n in notes) - min(n.pitch for n in notes)
+
+    def best_of(inst: Instrument) -> tuple[int, MapResult]:
+        p = replace(params, instrument=inst)
+        t = suggest_transpose(song, p)
+        res = map_song(song, replace(p, transpose=t))
+        return t, res
+
+    t_lyre, res_lyre = best_of(WIND_LYRE)
+    if span <= 24:
+        t_horn, res_horn = best_of(WIND_HORN)
+        if res_horn.stats.dropped <= res_lyre.stats.dropped:
+            return WIND_HORN, t_horn
+    return WIND_LYRE, t_lyre
 
 
 def suggest_transpose(song: MidiSong, params: MapParams) -> int:

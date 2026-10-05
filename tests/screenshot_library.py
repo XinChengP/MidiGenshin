@@ -19,10 +19,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def main():
-    QSettings("XinChengP", "MidiGenshin").clear()
+    QSettings("XinChengP/TestShot", "MidiGenshin").clear()
     app = QApplication(sys.argv)
     apply_theme(app)
-    win = MainWindow()
+    win = MainWindow(settings_org="XinChengP/TestShot")
     win.show()
 
     tmp = tempfile.mkdtemp(prefix="lyre_shot_")
@@ -40,9 +40,10 @@ def main():
         QTimer.singleShot(300, shoot)
 
     def shoot():
+        os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)
         out = os.path.join(ROOT, "build", "shot_library.png")
         ok = win.grab().save(out)
-        QSettings("XinChengP", "MidiGenshin").clear()
+        QSettings("XinChengP/TestShot", "MidiGenshin").clear()
         shutil.rmtree(tmp, ignore_errors=True)
         print(("OK  " if ok else "FAIL") + " shot_library.png")
         app.quit()

@@ -316,7 +316,8 @@ class Player(threading.Thread):
                 time.sleep(0.02)
                 continue
             if self._state == "paused":  # 刚恢复：重置时间原点
-                self._origin = time.perf_counter() - target
+                # 若曾跳播，恢复基准不早于跳播点，避免把跳过的时长静默等完
+                self._origin = time.perf_counter() - max(target, self._seek_time)
                 self._set_state("running")
             now = time.perf_counter() - self._origin
             remaining = target - now
@@ -348,11 +349,12 @@ class Player(threading.Thread):
         self._set_state("running")
         consecutive_fail = 0
         for action in self.actions:
+            if action.time < self._seek_time:
+                # 跳播点之前的动作整体跳过：不等待时间轴、不发送。
+                # 否则暂停中跳播再恢复，会把“当前等待点→跳播点”的时间静默等完。
+                continue
             if not self._wait_until(action.time):
                 break
-            if (action.kind == "down" and action.event_idx is not None
-                    and action.event_idx < self._seek_floor):
-                continue  # 跳播地板之前的动作不再发送
             if action.kind == "down":
                 for key in action.keys:
                     if not self.sender.down(key):

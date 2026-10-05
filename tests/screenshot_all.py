@@ -23,10 +23,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def main():
-    QSettings("XinChengP", "MidiGenshin").clear()
+    QSettings("XinChengP/TestShot", "MidiGenshin").clear()
     app = QApplication(sys.argv)
     apply_theme(app)
-    win = MainWindow()
+    win = MainWindow(settings_org="XinChengP/TestShot")
     win.show()
 
     demo = os.path.join(ROOT, "examples", "demo.mid")
@@ -90,7 +90,7 @@ def main():
         assert len(win.result.events) > 0
         path = os.path.join(out_dir, "shot_script.png")
         log.append(("OK  " if win.grab().save(path) else "FAIL") + " shot_script.png")
-        QSettings("XinChengP", "MidiGenshin").clear()
+        QSettings("XinChengP/TestShot", "MidiGenshin").clear()
         app.quit()
 
     steps.extend([s1, s2, s3, s4])

@@ -1,6 +1,8 @@
 @echo off
 rem 使用 PyInstaller 打包单文件 exe（需已安装 pyinstaller）
+rem 与 CI（.github/workflows/release.yml）保持一致
 cd /d "%~dp0"
-py -3.10 -m PyInstaller --noconfirm --onefile --windowed --name "原琴MIDI按键生成器" --icon assets\lyre.ico --add-data "assets;assets" run.py
-echo 打包完成：dist\原琴MIDI按键生成器.exe
+set EXCL=--exclude-module PySide6.QtNetwork --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQuickWidgets --exclude-module PySide6.QtSvg --exclude-module PySide6.QtSvgWidgets --exclude-module PySide6.QtPdf --exclude-module PySide6.QtPdfWidgets --exclude-module PySide6.QtMultimedia --exclude-module PySide6.QtMultimediaWidgets --exclude-module PySide6.QtSql --exclude-module PySide6.QtTest --exclude-module PySide6.QtXml --exclude-module PySide6.QtOpenGL --exclude-module PySide6.QtOpenGLWidgets --exclude-module PySide6.Qt3DCore --exclude-module PySide6.Qt3DRender --exclude-module PySide6.QtCharts --exclude-module PySide6.QtSerialPort --exclude-module PySide6.QtBluetooth --exclude-module PySide6.QtWebSockets --exclude-module PySide6.QtWebChannel --exclude-module PySide6.QtPositioning --exclude-module PySide6.QtSensors --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets --exclude-module PySide6.QtTextToSpeech --exclude-module PySide6.QtRemoteObjects --exclude-module PySide6.QtScxml --exclude-module PySide6.QtStateMachine --exclude-module PySide6.QtDesigner --exclude-module PySide6.QtHelp --exclude-module PySide6.QtUiTools --exclude-module PySide6.QtAxContainer
+py -3.10 -m PyInstaller --noconfirm --onefile --windowed --name MidiGenshin --icon assets\lyre.ico --add-data "assets;assets" %EXCL% run.py
+echo 打包完成：dist\MidiGenshin.exe
 pause

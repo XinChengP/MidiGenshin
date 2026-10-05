@@ -26,6 +26,7 @@ from genshin_lyre.exporter import export_script, parse_script  # noqa: E402
 from genshin_lyre.keys import KEYS, WIND_HORN, WIND_LYRE  # noqa: E402
 from genshin_lyre.mapper import (  # noqa: E402
     HOLD_FOLLOW,
+    HOLD_TAP,
     MapParams,
     map_song,
     suggest_transpose,
@@ -198,7 +199,10 @@ def test_map_direct():
     check("D4->S", r.events[1].combo == "S")
     check("E4->D", r.events[2].combo == "D")
     check("直击 3", r.stats.direct == 3 and r.stats.dropped == 0)
-    check("短按保持 60ms", abs(r.events[0].hold - 0.060) < 1e-6)
+    check("默认跟随音符 0.25s", abs(r.events[0].hold - 0.25) < 1e-6,
+          str(r.events[0].hold))
+    r_tap = map_song(_song_of([60]), MapParams(hold_mode=HOLD_TAP))
+    check("短按保持 60ms", abs(r_tap.events[0].hold - 0.060) < 1e-6)
 
 
 def test_map_transpose():
@@ -308,9 +312,8 @@ def test_export(tmp="test_out.txt"):
 # ---------------- 动作表 ----------------
 
 def test_build_actions():
-    from tests.make_test_midi import build_midi as bm
     song = _song_of([60, 60, 62])  # A A S —— 同键重弹
-    r = map_song(song, MapParams())
+    r = map_song(song, MapParams(hold_mode=HOLD_TAP))
     acts = build_actions(r.events, 1.0, "tap")
     downs = [(round(a.time, 4), a.kind, a.keys) for a in acts if a.kind == "down"]
     ups = [(round(a.time, 4), a.kind, a.keys) for a in acts if a.kind == "up"]
@@ -451,6 +454,21 @@ def test_script_roundtrip(tmp="test_script.txt"):
     os.remove(tmp)
 
 
+def test_auto_adjust():
+    from genshin_lyre.keys import WIND_HORN, WIND_LYRE
+    from genshin_lyre.mapper import auto_adjust
+    # 中音区 C 大调（跨度 12）：两排 +0
+    inst, t = auto_adjust(_song_of(list(range(60, 73))), MapParams())
+    check("中音区 -> 两排 +0", (inst.id, t) == ("horn", 0), f"{inst.id} {t}")
+    # 低音区（跨度 12）：两排 +12
+    inst, t = auto_adjust(_song_of(list(range(48, 61))), MapParams())
+    check("低音区 -> 两排 +12", (inst.id, t) == ("horn", 12), f"{inst.id} {t}")
+    # 大跨度（>24）：三排
+    inst, t = auto_adjust(_song_of(list(range(45, 89))), MapParams())
+    check("大跨度 -> 三排", inst.id == "lyre", inst.id)
+    # 二排劣于三排时不强用二排：高黑键密度大跨度直接三排（由上覆盖）
+
+
 def test_seek():
     from genshin_lyre.mapper import LyreEvent, MappedKey
     events = [LyreEvent(time=i * 0.08, keys=[MappedKey("A", 60, False)],
@@ -470,6 +488,23 @@ def test_seek():
           str([round(t, 2) for t in downs[-8:]]))
     # 跳播地板：事件 60 之前的动作不再发送（统计事件 0-5 后 seek 前）
     check("演奏线程正常结束", not p.is_alive())
+
+
+def test_export_v2_follow(tmp="test_v2.txt"):
+    # 跟随音符模式导出 v2，回读后保持时长，可再以 follow 演奏
+    r = map_song(_song_of([60], dur=960), MapParams(hold_mode=HOLD_FOLLOW))
+    export_script(r, MapParams(hold_mode=HOLD_FOLLOW), tmp, include_durations=True)
+    text = open(tmp, encoding="utf-8").read()
+    check("v2 头", "# genshin-lyre-script v2" in text)
+    _, r2, meta = parse_script(tmp)
+    check("v2 回读标记", meta["has_durations"] and meta["version"] == "v2")
+    check("v2 回读时长 0.5s", abs(r2.events[0].releases[0] - 0.5) < 1e-6,
+          str(r2.events[0].releases))
+    # 跟随模式动作表：up 在 1s 处
+    acts = build_actions(r2.events, 1.0, "follow")
+    ups = [a.time for a in acts if a.kind == "up"]
+    check("v2 follow 回读 up@0.5s", ups and abs(ups[0] - 0.5) < 1e-6, str(ups))
+    os.remove(tmp)
 
 
 def main():
@@ -497,7 +532,9 @@ def main():
     test_track_filter()
     test_blackkey_drop_stat()
     test_script_roundtrip()
+    test_auto_adjust()
     test_seek()
+    test_export_v2_follow()
     print(f"\n全部通过：{PASS} 项检查")
 
 

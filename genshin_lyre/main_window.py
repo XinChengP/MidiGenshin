@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QRadioButton,
     QScrollArea,
@@ -43,10 +44,21 @@ from PySide6.QtWidgets import (
 )
 
 from . import exporter, theme
+from .widgets import (
+    CountdownOverlay,
+    EventTableModel,
+    ExportDialog,
+    KeyDistributionWidget,
+    PreviewTable,
+    ToastOverlay,
+    fmt_clock,
+    parse_time_text,
+)
 from .keys import INSTRUMENTS, WIND_HORN, WIND_LYRE, pitch_name
 from .mapper import (
     HOLD_FOLLOW,
     HOLD_TAP,
+    auto_adjust,
     SNAP_DROP,
     SNAP_DOWN,
     SNAP_UP,
@@ -59,363 +71,10 @@ from .mapper import (
 from .midi_parser import MidiError, MidiSong, parse_midi
 from .player import STOP_KEY_VKS, KeySender, Player, build_actions, is_stop_key_pressed
 
-VERSION = "v1.1"
+VERSION = "v1.2"
 REPO_URL = "https://github.com/XinChengP/MidiGenshin"
 ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "assets", "lyre.ico")
-
-
-def fmt_clock(t: float) -> str:
-    ms = max(0, int(round(t * 1000)))
-    return f"{ms // 60000:02d}:{(ms % 60000) // 1000:02d}.{ms % 1000:03d}"
-
-
-def parse_time_text(text: str) -> float | None:
-    """'83' 或 '1:23' 或 '1:23.5' -> 秒。"""
-    text = text.strip()
-    try:
-        if ":" in text:
-            parts = text.split(":")
-            return int(parts[0]) * 60 + float(parts[1])
-        return float(text)
-    except (ValueError, IndexError):
-        return None
-
-
-# ---------------- 预览列表模型 ----------------
-
-class EventTableModel(QAbstractTableModel):
-    HEADERS = ("序号", "时间", "按键组合", "保持", "说明")
-
-    def __init__(self):
-        super().__init__()
-        self._rows: list[tuple] = []
-        self._times: list[float] = []
-        self._cursor = -1  # 播放中的当前行
-        self._colors = theme.get_model_colors(False)
-
-    def set_palette(self, colors: dict[str, QColor]):
-        self._colors = colors
-        if self._rows:
-            self.dataChanged.emit(self.index(0, 0),
-                                  self.index(len(self._rows) - 1, len(self.HEADERS) - 1))
-
-    def set_result(self, result: MapResult | None):
-        self.beginResetModel()
-        self._cursor = -1
-        self._rows = []
-        self._times = []
-        if result:
-            for i, e in enumerate(result.events):
-                notes = []
-                snapped = [pitch_name(k.pitch) for k in e.keys if k.snapped]
-                if e.is_chord:
-                    notes.append("和弦")
-                for p in snapped:
-                    notes.append(f"吸附自 {p}")
-                if e.dropped_collision:
-                    notes.append(f"重键丢弃 {e.dropped_collision}")
-                hold = e.hold
-                self._rows.append((
-                    i + 1,
-                    fmt_clock(e.time),
-                    e.combo,
-                    f"{int(round(hold * 1000))}ms",
-                    " · ".join(notes),
-                    e.is_chord,
-                    bool(snapped),
-                ))
-                self._times.append(e.time)
-        self.endResetModel()
-
-    def set_cursor(self, idx: int):
-        old, self._cursor = self._cursor, idx
-        for r in (old, idx):
-            if 0 <= r < len(self._rows):
-                self.dataChanged.emit(self.index(r, 0), self.index(r, len(self.HEADERS) - 1))
-
-    def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self._rows)
-
-    def columnCount(self, parent=QModelIndex()):
-        return len(self.HEADERS)
-
-    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
-            return self.HEADERS[section]
-        return None
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid():
-            return None
-        row = self._rows[index.row()]
-        col = index.column()
-        if role == Qt.ItemDataRole.DisplayRole:
-            return row[col]
-        if role == Qt.ItemDataRole.TextAlignmentRole and col in (0, 3):
-            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        if role == Qt.ItemDataRole.BackgroundRole:
-            if index.row() == self._cursor:
-                return self._colors["cursor_bg"]
-            if row[5]:
-                return self._colors["chord_bg"]
-        if role == Qt.ItemDataRole.ForegroundRole and col == 4 and row[6]:
-            return self._colors["snap_fg"]
-        if role == Qt.ItemDataRole.FontRole and col == 2:
-            f = QFont("Consolas")
-            f.setBold(row[5])
-            return f
-        return None
-
-    def find_row_by_time(self, t: float) -> int:
-        return max(0, bisect.bisect_right(self._times, t) - 1)
-
-
-class PreviewTable(QTableView):
-    """预览表格：Ctrl+C 复制选中行（时间<TAB>键1+键2）。"""
-
-    def keyPressEvent(self, event):
-        if (event.matches(event.StandardKey.Copy)
-                and self.selectionModel() and self.selectionModel().hasSelection()):
-            model = self.model()
-            rows = sorted({i.row() for i in self.selectionModel().selectedRows()})
-            lines = ["\t".join(str(model.index(r, c).data())
-                               for c in (1, 2)) for r in rows]
-            from PySide6.QtWidgets import QApplication
-            QApplication.clipboard().setText("\r\n".join(lines))
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-
-# ---------------- 键位分布条形图 ----------------
-
-class KeyDistributionWidget(QWidget):
-    ROW_H = 20
-
-    def __init__(self):
-        super().__init__()
-        self._data: list[tuple[str, int]] = []
-        self._max = 1
-        self._colors = theme.get_model_colors(False)
-        self._pal = theme.get_palette(False)
-        self.setMinimumHeight(24)
-
-    def set_palette(self, pal: dict, colors: dict):
-        self._pal = pal
-        self._colors = colors
-        self.update()
-
-    def set_data(self, usage: dict[str, int]):
-        self._data = sorted(usage.items(), key=lambda x: -x[1])
-        self._max = max(self._data[0][1], 1) if self._data else 1
-        self.setMinimumHeight(self.ROW_H * len(self._data) + 8)
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w = self.width()
-        p.setFont(QFont("Consolas", 9))
-        y = 2
-        for key, count in self._data:
-            p.setPen(QColor(self._pal["text"]))
-            p.drawText(QRectF(0, y, 24, self.ROW_H - 2), Qt.AlignmentFlag.AlignVCenter, key)
-            bar_w = max(2, (w - 100) * count / self._max)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(self._pal["accent"]))
-            p.drawRoundedRect(QRectF(28, y + 3, bar_w, self.ROW_H - 8), 2, 2)
-            p.setPen(QColor(self._pal["text2"]))
-            p.drawText(QRectF(w - 66, y, 66, self.ROW_H - 2),
-                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, str(count))
-            y += self.ROW_H
-        if not self._data:
-            p.setPen(QColor(self._pal["text3"]))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "—")
-
-
-# ---------------- 倒计时浮窗 ----------------
-
-class CountdownOverlay(QWidget):
-    finished = Signal()
-    cancelled = Signal()
-
-    def __init__(self, seconds: float, stop_key: str = "F8"):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self._stop_key = stop_key
-        self._deadline = _time.monotonic() + seconds
-        self._last_shown = -1
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 20)
-        card = QFrame()
-        card.setObjectName("cdCard")
-        card_lay = QVBoxLayout(card)
-        card_lay.setContentsMargins(16, 16, 16, 12)
-        self._num = QLabel("5")
-        self._num.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._num.setStyleSheet("color: white; font-size: 88px; font-weight: 700;")
-        tip = QLabel("即将开始演奏 · 切换到游戏窗口")
-        tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        tip.setStyleSheet("color: rgba(255,255,255,190); font-size: 13px;")
-        esc = QLabel(f"{stop_key} / Esc 取消")
-        esc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        esc.setStyleSheet("color: rgba(255,255,255,130); font-size: 12px;")
-        card_lay.addWidget(self._num)
-        card_lay.addWidget(tip)
-        card_lay.addWidget(esc)
-        lay.addWidget(card)
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(60)
-        self._timer.timeout.connect(self._tick)
-
-    def start(self):
-        geo = self.screen().availableGeometry()
-        self.adjustSize()
-        self.move(geo.center().x() - self.width() // 2,
-                  geo.center().y() - self.height() - 60)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        self._timer.start()
-        self._tick()
-
-    def _tick(self):
-        if is_stop_key_pressed(STOP_KEY_VKS[self._stop_key]):
-            self._done(False)
-            return
-        remain = self._deadline - _time.monotonic()
-        shown = max(0, math.ceil(remain))
-        if shown != self._last_shown:
-            self._last_shown = shown
-            self._num.setText(str(shown))
-        if remain <= 0:
-            self._done(True)
-
-    def _done(self, ok: bool):
-        self._timer.stop()
-        self.hide()
-        (self.finished if ok else self.cancelled).emit()
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
-            self._done(False)
-        else:
-            super().keyPressEvent(event)
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(QPen(QColor("#2AA68F"), 1))
-        p.setBrush(QColor(24, 32, 36, 235))
-        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 16, 16)
-
-
-class ToastOverlay(QWidget):
-    """置顶小提示（如"演奏结束"），数秒后自动消失。"""
-
-    def __init__(self, text: str, seconds: float = 2.0):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowStaysOnTopHint
-                         | Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lbl = QLabel(text)
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setStyleSheet(
-            "background: rgba(24,32,36,235); color: white; font-size: 16px; "
-            "font-weight: 600; padding: 18px 34px; border-radius: 12px; "
-            "border: 1px solid #2AA68F;")
-        lay.addWidget(lbl)
-        self._seconds = seconds
-
-    def show_toast(self):
-        geo = self.screen().availableGeometry()
-        self.adjustSize()
-        self.move(geo.center().x() - self.width() // 2,
-                  geo.center().y() - self.height() - 60)
-        self.show()
-        self.raise_()
-        QTimer.singleShot(int(self._seconds * 1000), self.close)
-
-
-# ---------------- 导出对话框 ----------------
-
-class ExportDialog(QDialog):
-    def __init__(self, parent, default_path: str):
-        super().__init__(parent)
-        self.setWindowTitle("导出时序脚本")
-        self.setMinimumWidth(460)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(18, 18, 18, 14)
-        lay.setSpacing(12)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("保存位置"))
-        self.path_edit = QLineEdit(default_path)
-        browse = QPushButton("浏览…")
-        browse.clicked.connect(self._browse)
-        row.addWidget(self.path_edit, 1)
-        row.addWidget(browse)
-        lay.addLayout(row)
-
-        self.header_chk = QCheckBox("包含注释头（来源与生成参数）")
-        self.header_chk.setChecked(True)
-        lay.addWidget(self.header_chk)
-
-        fmt_row = QHBoxLayout()
-        fmt_row.addWidget(QLabel("时间格式"))
-        self.rb_sec = QRadioButton("秒 (0.500)")
-        self.rb_clock = QRadioButton("分:秒.毫秒 (00:00.500)")
-        self.rb_sec.setChecked(True)
-        grp = QButtonGroup(self)
-        grp.addButton(self.rb_sec)
-        grp.addButton(self.rb_clock)
-        fmt_row.addWidget(self.rb_sec)
-        fmt_row.addWidget(self.rb_clock)
-        fmt_row.addStretch(1)
-        lay.addLayout(fmt_row)
-
-        self.speed_chk = QCheckBox("按当前演奏速度缩放时间")
-        lay.addWidget(self.speed_chk)
-
-        btns = QHBoxLayout()
-        btns.addStretch(1)
-        cancel = QPushButton("取消")
-        cancel.clicked.connect(self.reject)
-        ok = QPushButton("导出")
-        ok.setObjectName("accentBtn")
-        ok.clicked.connect(self.accept)
-        btns.addWidget(cancel)
-        btns.addWidget(ok)
-        lay.addLayout(btns)
-
-    def _browse(self):
-        path, _ = QFileDialog.getSaveFileName(self, "导出时序脚本", self.path_edit.text(),
-                                              "文本文件 (*.txt)")
-        if path:
-            self.path_edit.setText(path)
-
-    @property
-    def path(self) -> str:
-        return self.path_edit.text().strip()
-
-    @property
-    def include_header(self) -> bool:
-        return self.header_chk.isChecked()
-
-    @property
-    def clock_format(self) -> bool:
-        return self.rb_clock.isChecked()
-
-    @property
-    def scale_by_speed(self) -> bool:
-        return self.speed_chk.isChecked()
 
 
 # ---------------- 主窗口 ----------------
@@ -424,6 +83,9 @@ class MainWindow(QWidget):
     sig_progress = Signal(int)
     sig_state = Signal(str, str)
     sig_suggest_done = Signal(int)
+    sig_import_progress = Signal(int, int)
+    sig_import_done = Signal(list, list, object)
+    sig_auto_done = Signal(object, str, int)
 
     # ---- 主题 ----
     def _apply_dark(self, dark: bool):
@@ -440,7 +102,7 @@ class MainWindow(QWidget):
         self._apply_dark(not self._dark)
         self._settings.setValue("ui/dark", self._dark)
 
-    def __init__(self):
+    def __init__(self, settings_org: str = "XinChengP"):
         super().__init__()
         self.setWindowTitle(f"原神原琴 MIDI 按键生成器  {VERSION}")
         self.setMinimumSize(960, 640)
@@ -448,7 +110,7 @@ class MainWindow(QWidget):
         if os.path.exists(ICON_PATH):
             self.setWindowIcon(QIcon(ICON_PATH))
 
-        self._settings = QSettings("XinChengP", "MidiGenshin")
+        self._settings = QSettings(settings_org, "MidiGenshin")
         self._dark = self._settings.value("ui/dark", False, type=bool)
         geo = self._settings.value("ui/geometry")
         if geo is not None:
@@ -468,10 +130,16 @@ class MainWindow(QWidget):
         self._last_scroll = 0.0           # 播放跟随滚动节流
         self._rebuilding_tracks = False
         self._suggest_thread = None
+        self._auto_pending = None
         self._toast = None
         self._library: list[dict] = []   # {"path","raw","name","song","parsed_drums"}
         self._current_idx = -1
         self._rebuilding_library = False
+        self._importing = False
+        self._start_event_idx = 0
+        self._autoplay_timer = QTimer(self)
+        self._autoplay_timer.setSingleShot(True)
+        self._autoplay_timer.timeout.connect(self._autoplay_next)
 
         self.model = EventTableModel()
         self._apply_dark(self._dark)
@@ -485,7 +153,47 @@ class MainWindow(QWidget):
         self.sig_progress.connect(self._on_progress)
         self.sig_state.connect(self._on_player_state)
         self.sig_suggest_done.connect(self._on_suggest_done)
+        self.sig_import_progress.connect(self._on_import_progress)
+        self.sig_import_done.connect(self._on_import_done)
+        self.sig_auto_done.connect(self._on_auto_done)
         self._show_page(0)
+        self.spin_gap.setValue(self._settings.value("ui/gap", 5, type=int))
+        self._restore_library()
+
+    def _restore_library(self):
+        """启动时恢复上次的曲库（惰性解析；含每曲乐器/移调参数）。"""
+        import json as _json
+        saved = self._settings.value("library/entries", "", type=str)
+        meta = {}
+        if saved:
+            try:
+                meta = {os.path.abspath(d["path"]): d
+                        for d in (_json.loads(saved) if isinstance(saved, str) else [])}
+            except (ValueError, TypeError, KeyError):
+                meta = {}
+        legacy = self._settings.value("library/paths", [], type=list) or []
+        paths = [d.get("path") for d in meta.values()] or [
+            p for p in legacy if p and os.path.exists(p)]
+        paths = [p for p in paths if p and os.path.exists(p)]
+        if not paths:
+            return
+        names = set()
+        for p in paths:
+            d = meta.get(os.path.abspath(p), {})
+            name = os.path.basename(p)
+            if name in names:
+                stem = os.path.splitext(name)[0]
+                folder = os.path.basename(os.path.dirname(p))
+                name = f"{stem} · {folder}" if folder else name
+            names.add(name)
+            self._library.append({"path": p, "raw": None, "name": name,
+                                  "song": None, "parsed_drums": None,
+                                  "instrument_id": d.get("instrument_id"),
+                                  "transpose": d.get("transpose"),
+                                  "auto_done": bool(d.get("auto_done"))})
+        cur = self._settings.value("library/current", 0, type=int)
+        self._update_library_combo()
+        self._switch_current(min(max(cur, 0), len(self._library) - 1))
 
     # ---------- UI 构建 ----------
     def _build_ui(self):
@@ -532,10 +240,10 @@ class MainWindow(QWidget):
         icon = QLabel("♪")
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon.setStyleSheet("font-size: 52px; color: #34B49F;")
-        t1 = QLabel("将 .mid / .midi 拖到此处（支持多选与整个文件夹）")
+        t1 = QLabel("将 .mid / .midi / .txt 脚本 拖到此处")
         t1.setAlignment(Qt.AlignmentFlag.AlignCenter)
         t1.setStyleSheet("font-size: 18px; font-weight: 600; color: #1F2329;")
-        t2 = QLabel("或 点击选择文件")
+        t2 = QLabel("支持多选与整个文件夹，或点击选择")
         t2.setAlignment(Qt.AlignmentFlag.AlignCenter)
         t2.setStyleSheet("font-size: 13px; color: #6B7280;")
         dz.addWidget(icon)
@@ -579,21 +287,32 @@ class MainWindow(QWidget):
         self.cmb_library.setMaxVisibleItems(24)
         self.cmb_library.setToolTip("曲库：选择要处理的 MIDI（切换即重算）")
         self.cmb_library.currentIndexChanged.connect(self._on_library_changed)
-        self.btn_prev = QPushButton("◀")
-        self.btn_prev.setFixedWidth(32)
-        self.btn_prev.setToolTip("上一曲（Ctrl+←）")
-        self.btn_next = QPushButton("▶")
-        self.btn_next.setFixedWidth(32)
-        self.btn_next.setToolTip("下一曲（Ctrl+→）")
+        self.btn_prev = QPushButton("上一首")
+        self.btn_prev.setToolTip("切换到上一首（Ctrl+←）")
+        self.btn_next = QPushButton("下一首")
+        self.btn_next.setToolTip("切换到下一首（Ctrl+→）")
         self.btn_prev.clicked.connect(lambda: self._step_library(-1))
         self.btn_next.clicked.connect(lambda: self._step_library(1))
-        self.btn_remove = QPushButton("✕")
-        self.btn_remove.setFixedWidth(32)
+        self.btn_remove = QPushButton("删除本首")
         self.btn_remove.setToolTip("从曲库移除当前曲目")
         self.btn_remove.clicked.connect(self._remove_current)
 
         self._info_detail = QLabel("")
         self._info_detail.setStyleSheet("color: #6B7280;")
+
+        self.chk_autoplay = QCheckBox("连播")
+        self.chk_autoplay.setToolTip("勾选后：一首演奏结束，自动切换并演奏曲库中的下一首（无倒计时）")
+        self.chk_autoplay.setStyleSheet(
+            "QCheckBox { font-weight: 700; font-size: 14px; color: #34B49F; }"
+            "QCheckBox::indicator { width: 16px; height: 16px; }")
+        self.spin_gap = QSpinBox()
+        self.spin_gap.setRange(0, 60)
+        self.spin_gap.setValue(5)
+        self.spin_gap.setSuffix(" 秒")
+        self.spin_gap.setToolTip("连播时两首之间的间隔（0 = 无间隔）")
+        self.spin_gap.setVisible(False)
+        self.spin_gap.valueChanged.connect(self._on_gap_changed)
+        self.chk_autoplay.toggled.connect(self.spin_gap.setVisible)
 
         self.btn_add_files = QPushButton("添加文件")
         self.btn_add_files.clicked.connect(self._add_files_dialog)
@@ -605,6 +324,8 @@ class MainWindow(QWidget):
         lay.addWidget(self.btn_prev)
         lay.addWidget(self.btn_next)
         lay.addWidget(self.btn_remove)
+        lay.addWidget(self.chk_autoplay)
+        lay.addWidget(self.spin_gap)
         lay.addSpacing(8)
         lay.addWidget(self._info_detail, 2)
         lay.addWidget(self.btn_add_files)
@@ -641,14 +362,14 @@ class MainWindow(QWidget):
         self.cmb_instrument = QComboBox()
         for inst in (WIND_LYRE, WIND_HORN):
             self.cmb_instrument.addItem(inst.name, inst)
-        self.cmb_instrument.currentIndexChanged.connect(self._schedule_remap)
+        self.cmb_instrument.currentIndexChanged.connect(self._on_instrument_changed)
         grid.addWidget(self.cmb_instrument, 0, 1)
 
         grid.addWidget(QLabel("整体移调"), 0, 2)
         self.spin_transpose = QSpinBox()
         self.spin_transpose.setRange(-12, 12)
         self.spin_transpose.setSuffix(" 半音")
-        self.spin_transpose.valueChanged.connect(self._schedule_remap)
+        self.spin_transpose.valueChanged.connect(self._on_transpose_changed)
         grid.addWidget(self.spin_transpose, 0, 3)
         self.btn_suggest = QPushButton("智能移调建议")
         self.btn_suggest.clicked.connect(self._suggest_transpose)
@@ -680,6 +401,7 @@ class MainWindow(QWidget):
         self.cmb_hold = QComboBox()
         self.cmb_hold.addItem("短按（60ms）", HOLD_TAP)
         self.cmb_hold.addItem("跟随音符时长", HOLD_FOLLOW)
+        self.cmb_hold.setCurrentIndex(1)  # 默认跟随音符时长
         self.cmb_hold.currentIndexChanged.connect(self._schedule_remap)
         grid.addWidget(self.cmb_hold, 1, 3)
 
@@ -690,10 +412,14 @@ class MainWindow(QWidget):
         self.sld_speed.setValue(100)
         self.sld_speed.setMaximumWidth(140)
         self.sld_speed.valueChanged.connect(self._on_speed_changed)
-        self.lbl_speed = QLabel("100%")
-        self.lbl_speed.setStyleSheet("color: #6B7280;")
+        self.spin_speed = QSpinBox()
+        self.spin_speed.setRange(50, 200)
+        self.spin_speed.setValue(100)
+        self.spin_speed.setSuffix("%")
+        self.spin_speed.setToolTip("直接输入演奏速度（50%–200%）")
+        self.spin_speed.valueChanged.connect(self.sld_speed.setValue)
         speed_box.addWidget(self.sld_speed)
-        speed_box.addWidget(self.lbl_speed)
+        speed_box.addWidget(self.spin_speed)
         speed_box.addStretch(1)
         grid.addLayout(speed_box, 1, 4)
 
@@ -737,6 +463,8 @@ class MainWindow(QWidget):
             self.table.setColumnWidth(col, width)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(26)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_menu)
         lay.addWidget(self.table, 1)
         return w
 
@@ -856,6 +584,14 @@ class MainWindow(QWidget):
         self.sld_progress.setEnabled(False)
         self.sld_progress.setTracking(False)  # 拖动中不触发，松手才跳播
         self.sld_progress.sliderReleased.connect(self._on_seek_released)
+        self.lbl_start = QLabel("")
+        self.lbl_start.setStyleSheet("color: #B4761F; font-weight: 600;")
+        self.lbl_start.setVisible(False)
+        self.btn_clear_start = QPushButton("清除起点")
+        self.btn_clear_start.setVisible(False)
+        self.btn_clear_start.clicked.connect(self._clear_start)
+        lay.addWidget(self.lbl_start)
+        lay.addWidget(self.btn_clear_start)
         lay.addWidget(self.sld_progress, 1)
         self.lbl_progress = QLabel("0/0")
         self.lbl_progress.setStyleSheet("color: #6B7280;")
@@ -893,10 +629,8 @@ class MainWindow(QWidget):
         if txts:
             self._load_script(txts[0])
             return
-        if self.player:
-            self._on_stop()
-        added, errors = self._add_paths(paths)
-        self._import_finish(added, errors, prefer=paths[0] if len(paths) == 1 else None)
+        prefer = paths[0] if len(paths) == 1 else None
+        self._add_paths_async(paths, prefer=prefer)
 
     def _set_drag_over(self, on: bool):
         self.drop_zone.setProperty("dragOver", "true" if on else "false")
@@ -911,19 +645,13 @@ class MainWindow(QWidget):
                                                 "MIDI 文件 (*.mid *.midi)")
         if not paths:
             return
-        if self.player:
-            self._on_stop()
-        added, errors = self._add_paths(paths)
-        self._import_finish(added, errors)
+        self._add_paths_async(paths)
 
     def _add_dir_dialog(self):
         d = QFileDialog.getExistingDirectory(self, "添加文件夹（递归扫描其中的 MIDI）")
         if not d:
             return
-        if self.player:
-            self._on_stop()
-        added, errors = self._add_paths([d])
-        self._import_finish(added, errors)
+        self._add_paths_async([d])
 
     def load_file(self, path: str):
         """加载并切换到指定 MIDI；已在曲库中则直接切换。"""
@@ -989,7 +717,9 @@ class MainWindow(QWidget):
                 names.add(name)
                 self._library.append({"path": fp, "raw": raw, "name": name,
                                       "song": song,
-                                      "parsed_drums": self.chk_drums.isChecked()})
+                                      "parsed_drums": self.chk_drums.isChecked(),
+                                      "instrument_id": None, "transpose": None,
+                                      "auto_done": False})
                 existing.add(ap)
                 added.append(len(self._library) - 1)
         finally:
@@ -1000,7 +730,82 @@ class MainWindow(QWidget):
             self._show_page(1)
             self._set_script_ui(False)
             self._update_library_combo()
+            self._persist_library()
         return added, errors
+
+    def _add_paths_async(self, paths, prefer=None):
+        """后台批量导入：大文件夹不冻结界面，状态栏显示进度。"""
+        if self._importing:
+            self._set_status("正在导入中，请稍候…")
+            return
+        if self.player:
+            self._on_stop()
+        files = self._iter_midi_files(paths)
+        if not files:
+            self._set_status("未找到 .mid / .midi 文件")
+            return
+        existing = {os.path.abspath(e["path"]) for e in self._library}
+        todo = [f for f in files if os.path.abspath(f) not in existing]
+        if not todo:
+            self._import_finish([], [], prefer=prefer)
+            return
+        self._importing = True
+        for w in (self.btn_add_files, self.btn_add_dir):
+            w.setEnabled(False)
+        drums = self.chk_drums.isChecked()
+        total = len(todo)
+        self._set_status(f"正在导入 0/{total} …")
+
+        def work():
+            entries, errors = [], []
+            for fp in todo:
+                try:
+                    with open(fp, "rb") as f:
+                        raw = f.read()
+                    song = parse_midi(raw, filepath=fp, include_drums=drums)
+                    entries.append({"path": fp, "raw": raw, "song": song,
+                                    "parsed_drums": drums, "name": "",
+                                    "instrument_id": None, "transpose": None,
+                                    "auto_done": False})
+                except (MidiError, OSError) as e:
+                    errors.append(f"{os.path.basename(fp)}：{e}")
+                self.sig_import_progress.emit(len(entries) + len(errors), total)
+            self.sig_import_done.emit(entries, errors, prefer)
+
+        threading.Thread(target=work, daemon=True, name="lyre-import").start()
+
+    def _on_import_progress(self, n, total):
+        self._set_status(f"正在导入 {n}/{total} …")
+
+    def _on_import_done(self, entries, errors, prefer):
+        self._importing = False
+        for w in (self.btn_add_files, self.btn_add_dir):
+            w.setEnabled(True)
+        existing = {os.path.abspath(e["path"]) for e in self._library}
+        names = {e["name"] for e in self._library}
+        added = []
+        for ent in entries:
+            ap = os.path.abspath(ent["path"])
+            if ap in existing:
+                continue
+            name = os.path.basename(ent["path"])
+            if name in names:  # 重名标注所在文件夹
+                stem = os.path.splitext(name)[0]
+                folder = os.path.basename(os.path.dirname(ent["path"]))
+                name = f"{stem} · {folder}" if folder else name
+            names.add(name)
+            ent["name"] = name
+            self._library.append(ent)
+            existing.add(ap)
+            added.append(len(self._library) - 1)
+        if added:
+            self.script_mode = False
+            self._excluded_tracks = set()
+            self._show_page(1)
+            self._set_script_ui(False)
+            self._update_library_combo()
+            self._persist_library()
+        self._import_finish(added, errors, prefer)
 
     def _import_finish(self, added, errors, prefer=None):
         """批量导入后的收尾：选择目标曲目并汇报结果。"""
@@ -1012,6 +817,8 @@ class MainWindow(QWidget):
                     break
         if added:
             self._switch_current(added[0])
+        if not added and not errors:
+            return  # 所选曲目已在曲库中，切换提示已给出
         msg = f"已添加 {len(added)} 首 · 曲库共 {len(self._library)} 首"
         if errors:
             msg += f" · 失败 {len(errors)}：{errors[0]}"
@@ -1020,29 +827,165 @@ class MainWindow(QWidget):
         self._set_status(msg)
 
     def _entry_song(self, entry):
-        """取条目曲目（含打击乐开关的解析缓存）。"""
+        """取条目曲目（惰性读取 + 打击乐开关的解析缓存）。失败返回 None 并剔除条目。"""
         drums = self.chk_drums.isChecked()
         if entry["song"] is None or entry["parsed_drums"] != drums:
-            entry["song"] = parse_midi(entry["raw"], filepath=entry["path"],
-                                       include_drums=drums)
+            raw = entry["raw"]
+            if raw is None:
+                try:
+                    with open(entry["path"], "rb") as f:
+                        raw = f.read()
+                except OSError as e:
+                    self._drop_entry(entry, f"文件无法读取：{e}")
+                    return None
+            try:
+                entry["song"] = parse_midi(raw, filepath=entry["path"],
+                                           include_drums=drums)
+            except MidiError as e:
+                self._drop_entry(entry, f"解析失败：{e}")
+                return None
+            entry["raw"] = raw
             entry["parsed_drums"] = drums
         return entry["song"]
+
+    def _drop_entry(self, entry, reason: str):
+        """剔除失效条目（文件丢失/损坏），并调整当前索引。"""
+        if entry in self._library:
+            i = self._library.index(entry)
+            self._library.remove(entry)
+            if self._current_idx >= i:
+                self._current_idx -= 1
+        self._update_library_combo()
+        self._persist_library()
+        self._set_status(f"已移除失效曲目 {os.path.basename(entry['path'])}（{reason}）")
+
+    def _persist_library(self):
+        """把曲库（含每曲乐器/移调参数）与当前曲写入设置。"""
+        import json as _json
+        data = [{"path": e["path"], "instrument_id": e.get("instrument_id"),
+                 "transpose": e.get("transpose"), "auto_done": bool(e.get("auto_done"))}
+                for e in self._library]
+        self._settings.setValue("library/entries", _json.dumps(data, ensure_ascii=False))
+        self._settings.setValue("library/current", self._current_idx)
 
     def _switch_current(self, idx):
         if not (0 <= idx < len(self._library)):
             return
         self._current_idx = idx
         entry = self._library[idx]
+        need_auto = not entry.get("auto_done")
         self.song = self._entry_song(entry)
+        if self.song is None:  # 条目已被剔除；尝试相邻曲目
+            if self._library:
+                self._switch_current(min(self._current_idx, len(self._library) - 1))
+            else:
+                self._current_idx = -1
+                self.song = None
+                self.result = None
+                self._show_page(0)
+            return
         self._path = entry["path"]
         self.script_mode = False
         self._excluded_tracks = set()
         self._show_page(1)
         self._set_script_ui(False)
+        self._apply_entry_ui(entry)   # 每曲独立的乐器/移调（不触发信号）
         self._update_library_combo()
         self._update_info_bar()
         self._remap()
+        self._persist_library()
         self._set_status(f"已切换到 {entry['name']} · {len(self.song.notes)} 音符")
+        if need_auto:
+            self._auto_adjust_current()
+
+    def _apply_entry_ui(self, entry):
+        """把条目自己的乐器/移调应用到参数区（blockSignals，不触发重算/锁定）。"""
+        inst = next((v for v in INSTRUMENTS.values()
+                     if v.id == (entry.get("instrument_id") or "lyre")), WIND_LYRE)
+        idx = self.cmb_instrument.findData(inst)
+        self.cmb_instrument.blockSignals(True)
+        self.cmb_instrument.setCurrentIndex(max(0, idx))
+        self.cmb_instrument.blockSignals(False)
+        t = entry.get("transpose") or 0
+        self.spin_transpose.blockSignals(True)
+        self.spin_transpose.setValue(max(-12, min(12, int(t))))
+        self.spin_transpose.blockSignals(False)
+        self._update_params_summary()
+
+    def _lock_current_entry(self):
+        """用户手动改动后：把当前乐器/移调固化为该曲自己的参数。"""
+        if not (0 <= self._current_idx < len(self._library)):
+            return
+        e = self._library[self._current_idx]
+        e["instrument_id"] = self._current_params().instrument.id
+        e["transpose"] = self.spin_transpose.value()
+        e["auto_done"] = True
+
+    def _on_transpose_changed(self):
+        self._lock_current_entry()
+        self._schedule_remap()
+
+    def _on_instrument_changed(self):
+        self._lock_current_entry()
+        self._schedule_remap()
+
+    def _auto_adjust_current(self):
+        """加载/切曲后自动选择乐器与移调（后台，不卡界面）。
+
+        若上一个调整线程仍在跑，则记为待处理，完成时接力执行，
+        避免连续快速切曲时后面的请求被静默丢弃。
+        """
+        if not self.song:
+            return
+        entry = self._library[self._current_idx]
+        if entry.get("auto_done"):
+            return
+        if self._suggest_thread:
+            self._auto_pending = entry
+            return
+        song = self.song
+        self.btn_suggest.setEnabled(False)
+        self.btn_suggest.setText("自动调整中…")
+        self._set_status(f"正在为 {entry['name']} 自动选择键位与移调…")
+        params = self._current_params()
+
+        def work():
+            inst, t = auto_adjust(song, params)
+            self.sig_auto_done.emit(entry, inst.id, t)
+
+        self._suggest_thread = threading.Thread(target=work, daemon=True,
+                                                name="lyre-auto")
+        self._suggest_thread.start()
+
+    def _on_auto_done(self, entry, inst_id: str, t: int):
+        self._suggest_thread = None
+        if self.song:
+            self.btn_suggest.setEnabled(not self._playing)
+        self.btn_suggest.setText("智能移调建议")
+        if entry in self._library and not entry.get("auto_done"):
+            entry["instrument_id"] = inst_id
+            entry["transpose"] = max(-12, min(12, int(t)))
+            entry["auto_done"] = True
+            if self._library[self._current_idx] is entry:
+                # 重算会重置起点；按时间在新的结果里找回起点
+                saved_t = None
+                if (self.result and 0 < self._start_event_idx < len(self.result.events)):
+                    saved_t = self.result.events[self._start_event_idx].time
+                self._apply_entry_ui(entry)
+                self._remap()
+                if saved_t is not None and self.result.events:
+                    self.set_start_from_row(self.model.find_row_by_time(saved_t))
+                self._persist_library()
+                name = "原琴（两排）" if inst_id == "horn" else "原琴（三排）"
+                dropped = self.result.stats.dropped if self.result else 0
+                tip = "" if dropped == 0 else f"（丢弃 {dropped}，可再手动微调）"
+                self._set_status(f"已自动调整：{name} · 移调 {entry['transpose']:+d}{tip}")
+        pending = self._auto_pending
+        self._auto_pending = None
+        if (pending is not None and pending in self._library
+                and not pending.get("auto_done")
+                and self._library[self._current_idx] is pending):
+            self._auto_adjust_current()  # 接力处理挂起的自动调整
 
     def _on_library_changed(self, idx):
         if self._rebuilding_library or idx == self._current_idx or idx < 0:
@@ -1069,6 +1012,7 @@ class MainWindow(QWidget):
             self._update_library_combo()
             self._show_page(0)
             self._set_status("曲库已清空 · 将 .mid 文件拖入窗口开始")
+            self._persist_library()
             return
         self._switch_current(min(self._current_idx, len(self._library) - 1))
 
@@ -1077,6 +1021,11 @@ class MainWindow(QWidget):
         self.cmb_library.clear()
         for i, e in enumerate(self._library):
             self.cmb_library.addItem(e["name"], i)
+            tip = e["path"]
+            if e["song"] is not None:
+                tip += (chr(10) + f"时长 {fmt_clock(e['song'].duration)} · "
+                        f"{len(e['song'].notes)} 音符")
+            self.cmb_library.setItemData(i, tip, Qt.ItemDataRole.ToolTipRole)
         if 0 <= self._current_idx < len(self._library):
             self.cmb_library.setCurrentIndex(self._current_idx)
         multi = len(self._library) > 1
@@ -1112,7 +1061,7 @@ class MainWindow(QWidget):
         for w in (self.cmb_library, self.btn_prev, self.btn_next, self.btn_remove):
             w.setVisible(not script)
         for w in (self.cmb_instrument, self.spin_transpose, self.btn_suggest,
-                  self.cmb_snap, self.sld_tol, self.chk_drums):
+                  self.cmb_snap, self.sld_tol, self.chk_drums, self.spin_speed):
             w.setEnabled(not script and not self._playing)
 
     def _show_load_error(self, msg: str):
@@ -1150,7 +1099,10 @@ class MainWindow(QWidget):
         self._remap_timer.start()
 
     def _on_speed_changed(self):
-        self.lbl_speed.setText(f"{self.sld_speed.value()}%")
+        if self.spin_speed.value() != self.sld_speed.value():
+            self.spin_speed.blockSignals(True)
+            self.spin_speed.setValue(self.sld_speed.value())
+            self.spin_speed.blockSignals(False)
         self._update_params_summary()
 
     def _on_drums_toggled(self):
@@ -1172,6 +1124,9 @@ class MainWindow(QWidget):
 
     def _apply_result(self):
         """把 self.result 应用到列表/统计/按钮（MIDI 与脚本模式共用）。"""
+        self._start_event_idx = 0
+        self.lbl_start.setVisible(False)
+        self.btn_clear_start.setVisible(False)
         self.model.set_result(self.result)
         self.sld_progress.setRange(0, max(0, len(self.result.events) - 1))
         self.sld_progress.setValue(0)
@@ -1284,7 +1239,7 @@ class MainWindow(QWidget):
         self.btn_suggest.setEnabled(bool(self.song) and not self._playing)
         self.btn_suggest.setText("智能移调建议")
         if self.song:
-            self.spin_transpose.setValue(best)
+            self.spin_transpose.setValue(best)   # 触发 _on_transpose_changed → 锁定
             self._set_status(f"已应用移调建议：{best:+d} 半音（丢弃数最少）")
 
     def _jump_to_time(self):
@@ -1323,6 +1278,16 @@ class MainWindow(QWidget):
             return
         actions = build_actions(self.result.events, self.speed,
                                 self._current_params().hold_mode)
+        if self._start_event_idx > 0 and self._start_event_idx < len(self.result.events):
+            # 从起点开始：截取之后的动作并把时间轴整体前移（起点归零）。
+            # 注意必须边遍历边收集，事后过滤无法剔除未前移的旧动作。
+            t0 = self.result.events[self._start_event_idx].time / self.speed
+            sliced = []
+            for a in actions:
+                if a.time >= t0 - 1e-9:
+                    a.time -= t0
+                    sliced.append(a)
+            actions = sliced
         sender = KeySender()
         self.player = Player(
             actions, sender,
@@ -1349,6 +1314,7 @@ class MainWindow(QWidget):
             self.btn_pause.setText("▶ 继续")
 
     def _on_stop(self):
+        self._autoplay_timer.stop()
         if self.player:
             self.player.stop()
 
@@ -1381,6 +1347,17 @@ class MainWindow(QWidget):
                 self._set_status("⏸ 已暂停 · 点「▶ 继续」恢复")
         elif state == "finished":
             self._finish_playback("演奏结束")
+            if (self.chk_autoplay.isChecked() and len(self._library) > 1
+                    and not self.script_mode):
+                self._step_library(1)
+                gap = self.spin_gap.value()
+                name = self._library[self._current_idx]["name"]
+                if gap <= 0:
+                    self._set_status(f"连播：立即开始下一首 {name}")
+                    self._start_playback()
+                else:
+                    self._set_status(f"连播：{gap} 秒后开始下一首 {name}")
+                    self._autoplay_timer.start(gap * 1000)
         elif state == "stopped":
             self._finish_playback("已停止")
         elif state == "aborted":
@@ -1410,8 +1387,58 @@ class MainWindow(QWidget):
         self._set_script_ui(self.script_mode)
         self.cmb_hold.setEnabled(not playing)
         self.sld_speed.setEnabled(not playing)
+        self.spin_speed.setEnabled(not playing)
         self.cmb_stopkey.setEnabled(not playing)
         self.sld_progress.setEnabled(playing)
+
+    def _on_table_menu(self, pos):
+        """预览列表右键：设置/清除演奏起点。"""
+        if not self.result:
+            return
+        row = self.table.indexAt(pos).row()
+        if row < 0 or row >= len(self.result.events):
+            return
+        menu = QMenu(self)
+        act = menu.addAction(f"♪ 从这一行开始演奏（{fmt_clock(self.result.events[row].time)}）")
+        act.triggered.connect(lambda: self.set_start_from_row(row))
+        if self._start_event_idx > 0:
+            act2 = menu.addAction("清除起始点")
+            act2.triggered.connect(self._clear_start)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def set_start_from_row(self, row: int):
+        if not (self.result and 0 <= row < len(self.result.events)):
+            return
+        self._start_event_idx = row
+        self.model.set_start_row(row)
+        ev = self.result.events[row]
+        self.lbl_start.setText(f"起点 {fmt_clock(ev.time)}")
+        self.lbl_start.setVisible(True)
+        self.btn_clear_start.setVisible(True)
+        self.sld_progress.setValue(row)
+        self._set_status(f"已设起点 {fmt_clock(ev.time)}（事件 {row + 1}）"
+                         "· 点「播放」从此处开始" +
+                         ("，演奏中右键可随时跳转" if self._playing else ""))
+        if self._playing and self.player:
+            self.player.seek(row)
+
+    def _clear_start(self):
+        self._start_event_idx = 0
+        self.model.set_start_row(-1)
+        self.lbl_start.setVisible(False)
+        self.btn_clear_start.setVisible(False)
+        self._set_status("已清除起始点，将从曲首开始演奏")
+
+    def _autoplay_next(self):
+        """连播间隔到点：开始下一首（期间被打断则放弃）。"""
+        if self._playing or not self.chk_autoplay.isChecked() or self.script_mode:
+            return
+        if len(self._library) < 2:
+            return
+        self._start_playback()
+
+    def _on_gap_changed(self, v: int):
+        self._settings.setValue("ui/gap", v)
 
     def _on_stopkey_changed(self):
         name = self.cmb_stopkey.currentText()
@@ -1465,6 +1492,7 @@ class MainWindow(QWidget):
                 include_header=dlg.include_header,
                 clock_format=dlg.clock_format,
                 speed=self.speed if dlg.scale_by_speed else 1.0,
+                include_durations=dlg.include_durations,
             )
             self._set_status(f"导出成功：{dlg.path}（{n} 个事件）")
         except OSError as e:
@@ -1495,6 +1523,7 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event):
         self._settings.setValue("ui/geometry", self.saveGeometry())
+        self._persist_library()
         if self.player:
             self.player.stop()
             self.player.join(timeout=1.0)  # 等线程释放按键，避免残留卡键

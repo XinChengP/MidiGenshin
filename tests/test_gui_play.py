@@ -15,7 +15,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtWidgets import QApplication
 
 import genshin_lyre.main_window as mw
@@ -35,9 +35,10 @@ def check(name, cond, detail=""):
 
 
 def main():
+    QSettings("XinChengP/Test", "MidiGenshin").clear()
     app = QApplication(sys.argv)
     apply_theme(app)
-    win = MainWindow()
+    win = MainWindow(settings_org="XinChengP/Test")
     win.show()
 
     # 加载演示曲（同步解析+映射）
