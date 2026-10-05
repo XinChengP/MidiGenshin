@@ -3,3 +3,5 @@ __pycache__/
 build/
 dist/
 *.log
+# PyInstaller 首次打包时自动生成的构建配置，属于生成物，无需纳入版本管理
+MidiGenshin.spec
