@@ -2,6 +2,8 @@
 
 读取 `.mid` / `.midi` 乐曲，自动转换为原神原琴可用的键盘按键时序（三排 / 两排两种键位），提供时序预览、txt 脚本导出、倒计时后前台自动演奏。
 
+> 免安装版：到 [Releases](https://github.com/XinChengP/MidiGenshin/releases) 下载 `MidiGenshin.exe` 直接运行。
+
 ## 功能
 
 - **乐器切换**：原琴·三排（21 键，低/中/高三行，C3–B5）/ 原琴·两排（14 键，中/高两行，C4–B5，无低音行）
@@ -43,9 +45,9 @@ py -3.10 -m genshin_lyre [可选：mid 文件路径]
 
 ## 使用流程
 
-1. 把 `.mid` 文件拖进窗口；
-2. 在「参数」区选择原琴键位（三排 / 两排），调整移调 / 黑键策略 / 和弦容差 / 按键模式 / 演奏速度（改动即时重算）；
-3. 点「智能移调建议」可自动选丢弃最少的移调档位；
+1. 把 `.mid` 拖进窗口（支持多选 / 整个文件夹，也可用「添加文件 / 添加文件夹」批量导入曲库）；
+2. 每首曲子加载时会**自动选择键位布局与移调**（跨度 ≤ 两个八度优先两排）；如需微调，在「参数」区改乐器 / 移调 / 黑键策略 / 和弦容差 / 按键模式 / 演奏速度（改动即时重算，且只对当前曲目生效）；
+3. 点「智能移调建议」可按当前乐器重新挑选丢弃最少的移调档位；
 4. 「导出 txt」留存按键时序脚本；
 5. （可选）在预览列表右键选「从这一行开始演奏」练习某一段；点「▶ 播放」→ 倒计时期间切到原神窗口（打开原琴）→ 从起点自动演奏；
    演奏中切回本工具会自动暂停，切回游戏自动恢复；任意时刻 **F8** 急停，无按键残留。
@@ -93,27 +95,29 @@ assets/lyre.ico        应用图标
 run.py                 PyInstaller 打包入口
 build_exe.bat          一键打包脚本
 examples/demo.mid      演示用 MIDI（含变速、黑键、超音域、打击乐轨）
-tests/                 自动化测试与截图自检脚本
-.github/workflows      CI（Windows 上自动跑测试）
+tests/                 自动化测试（pipeline/library/gui/起点）与截图自检脚本
+.github/workflows      CI：Windows 上自动跑测试；推 v* 标签自动打包发 Release
 ```
 
 ## 测试
 
 ```bat
-:: 核心管线（解析/映射/双乐器/导出/动作表/演奏计时/暂停急停/音轨筛选/脚本回读/跳播）共 100 项检查
+:: 核心管线（解析/映射/双乐器/自动键位/导出/动作表/演奏计时/暂停急停/音轨筛选/脚本回读/跳播）共 108 项
 python tests\test_pipeline.py
 
-:: 曲库（批量添加/文件夹/切换/移除）共 18 项检查
+:: 曲库与播放联动（批量/文件夹/切换/自动调整/连播间隔/速度输入/持久化）共 35 项
 python tests\test_library.py
 
-:: GUI 播放链路（加载/倒计时/演奏/暂停冻结/停止）共 13 项检查（dry-run，不发送真实按键）
+:: GUI 播放链路（加载/倒计时/演奏/暂停冻结/停止）共 13 项（dry-run，不发送真实按键）
 python tests\test_gui_play.py
+
+:: 起点演奏（设起点/时间轴前移/清除/重算重置）共 9 项
+python tests\test_start_from.py
 
 :: 界面截图自检（输出到 build\）
 python -m genshin_lyre examples\demo.mid --screenshot build\shot_loaded.png
 python -m genshin_lyre --screenshot build\shot_initial.png
-python tests\screenshot_overlay.py
-python tests\screenshot_horn.py
+python tests\screenshot_all.py
 python tests\screenshot_library.py
 ```
 
