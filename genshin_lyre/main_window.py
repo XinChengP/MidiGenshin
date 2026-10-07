@@ -71,7 +71,7 @@ from .mapper import (
 from .midi_parser import MidiError, MidiSong, parse_midi
 from .player import STOP_KEY_VKS, KeySender, Player, build_actions, is_stop_key_pressed
 
-VERSION = "v1.2"
+VERSION = "v1.3"
 REPO_URL = "https://github.com/XinChengP/MidiGenshin"
 ICON_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "assets", "lyre.ico")
@@ -658,8 +658,7 @@ class MainWindow(QWidget):
         if path.lower().endswith(".txt"):
             self._load_script(path)
             return
-        if self.player:
-            self._on_stop()
+        self._detach_player()
         apath = os.path.abspath(path)
         for i, e in enumerate(self._library):
             if os.path.abspath(e["path"]) == apath:
@@ -738,8 +737,7 @@ class MainWindow(QWidget):
         if self._importing:
             self._set_status("正在导入中，请稍候…")
             return
-        if self.player:
-            self._on_stop()
+        self._detach_player()
         files = self._iter_midi_files(paths)
         if not files:
             self._set_status("未找到 .mid / .midi 文件")
@@ -990,8 +988,7 @@ class MainWindow(QWidget):
     def _on_library_changed(self, idx):
         if self._rebuilding_library or idx == self._current_idx or idx < 0:
             return
-        if self.player:
-            self._on_stop()
+        self._detach_player()
         self._switch_current(idx)
 
     def _step_library(self, step):
@@ -1002,8 +999,7 @@ class MainWindow(QWidget):
     def _remove_current(self):
         if not self._library:
             return
-        if self.player:
-            self._on_stop()
+        self._detach_player()
         del self._library[self._current_idx]
         if not self._library:
             self._current_idx = -1
@@ -1035,6 +1031,7 @@ class MainWindow(QWidget):
 
     def _load_script(self, path: str):
         """回读导出的 txt 时序脚本（可再预览与播放）。"""
+        self._detach_player()
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
@@ -1061,7 +1058,7 @@ class MainWindow(QWidget):
         for w in (self.cmb_library, self.btn_prev, self.btn_next, self.btn_remove):
             w.setVisible(not script)
         for w in (self.cmb_instrument, self.spin_transpose, self.btn_suggest,
-                  self.cmb_snap, self.sld_tol, self.chk_drums, self.spin_speed):
+                  self.cmb_snap, self.sld_tol, self.chk_drums):
             w.setEnabled(not script and not self._playing)
 
     def _show_load_error(self, msg: str):
@@ -1257,6 +1254,7 @@ class MainWindow(QWidget):
             return
         secs = (0, 3, 5, 10)[self.cmb_countdown.currentIndex()]
         self.btn_play.setEnabled(False)
+        self.cmb_stopkey.setEnabled(False)  # 倒计时与演奏期间锁定，保证浮窗/引擎用同一颗急停键
         self._set_status("倒计时…" if secs else "准备开始…")
         if secs <= 0:
             self._start_playback()
@@ -1278,16 +1276,6 @@ class MainWindow(QWidget):
             return
         actions = build_actions(self.result.events, self.speed,
                                 self._current_params().hold_mode)
-        if self._start_event_idx > 0 and self._start_event_idx < len(self.result.events):
-            # 从起点开始：截取之后的动作并把时间轴整体前移（起点归零）。
-            # 注意必须边遍历边收集，事后过滤无法剔除未前移的旧动作。
-            t0 = self.result.events[self._start_event_idx].time / self.speed
-            sliced = []
-            for a in actions:
-                if a.time >= t0 - 1e-9:
-                    a.time -= t0
-                    sliced.append(a)
-            actions = sliced
         sender = KeySender()
         self.player = Player(
             actions, sender,
@@ -1295,6 +1283,7 @@ class MainWindow(QWidget):
             on_state=lambda s, d: self.sig_state.emit(s, d),
             focus_guard_hwnd=int(self.winId()),
             stop_vk=self.cmb_stopkey.currentData(),
+            start_event_idx=self._start_event_idx,
         )
         self._playing = True
         self._paused = False
@@ -1318,6 +1307,30 @@ class MainWindow(QWidget):
         if self.player:
             self.player.stop()
 
+    def _detach_player(self):
+        """替换曲目/脚本前收尾：掐断旧播放器回调与倒计时，终态不污染新内容。
+
+        与 _on_stop 的区别：不再等待 stopped 状态回调（回调已断开），
+        由这里直接复位演奏相关 UI；旧线程自行退出并释放按键。
+        """
+        self._autoplay_timer.stop()
+        if self._overlay is not None:
+            self._overlay.abort()
+            self._overlay = None
+        if self.player:
+            p = self.player
+            self.player = None
+            p.on_progress = None
+            p.on_state = None
+            p.stop()
+        if self._playing:
+            self._playing = False
+            self._paused = False
+            self.btn_pause.setText("⏸ 暂停")
+            self.btn_pause.setStyleSheet("")
+            self.model.set_cursor(-1)
+            self._set_playing_ui(False)
+
     def _on_progress(self, idx: int):
         self.sld_progress.setValue(idx)
         self.lbl_progress.setText(f"{idx + 1}/{len(self.result.events) if self.result else 0}")
@@ -1334,7 +1347,7 @@ class MainWindow(QWidget):
             self._paused = False
             self.btn_pause.setText("⏸ 暂停")
             self.btn_pause.setStyleSheet("")
-            self._set_status("演奏中 · F8 急停")
+            self._set_status(f"演奏中 · {self.cmb_stopkey.currentText()} 急停")
         elif state == "paused":
             self._paused = True
             self.btn_pause.setText("▶ 继续")
@@ -1361,7 +1374,7 @@ class MainWindow(QWidget):
         elif state == "stopped":
             self._finish_playback("已停止")
         elif state == "aborted":
-            self._finish_playback("已通过 F8 急停")
+            self._finish_playback(f"已通过 {self.cmb_stopkey.currentText()} 急停")
         elif state == "error":
             self._finish_playback(detail)
             QMessageBox.warning(self, "演奏中止", detail)

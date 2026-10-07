@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,11 +23,12 @@ from tests.make_test_midi import (  # noqa: E402
     tempo,
 )
 
-from genshin_lyre.exporter import export_script, parse_script  # noqa: E402
+from genshin_lyre.exporter import export_script, parse_script, validate_script_keys  # noqa: E402
 from genshin_lyre.keys import KEYS, WIND_HORN, WIND_LYRE  # noqa: E402
 from genshin_lyre.mapper import (  # noqa: E402
     HOLD_FOLLOW,
     HOLD_TAP,
+    auto_adjust,
     MapParams,
     map_song,
     suggest_transpose,
@@ -286,27 +288,40 @@ def test_suggest_transpose():
     song = _song_of([61, 61, 61, 61, 60])
     best = suggest_transpose(song, MapParams())
     check("移调建议 -1", best == -1, str(best))
+    # 哨兵回归：所有候选均至少丢弃 2 个音符时，必须仍选出最优档位（旧实现错误返回 0）
+    check("全候选有丢弃 -> -1", suggest_transpose(_song_of([0, 61, 127]), MapParams()) == -1,
+          str(suggest_transpose(_song_of([0, 61, 127]), MapParams())))
+    check("单低音 -> +12", suggest_transpose(_song_of([36]), MapParams()) == 12)
+    check("单高音 -> -12", suggest_transpose(_song_of([95]), MapParams()) == -12)
+    check("无可挽救 -> 0", suggest_transpose(_song_of([0, 127]), MapParams()) == 0)
 
 
 # ---------------- 导出 ----------------
 
-def test_export(tmp="test_out.txt"):
-    r = map_song(_song_of([60, 64, 67, 72], dur=960), MapParams())
-    n = export_script(r, MapParams(), tmp, source_name="test.mid")
-    with open(tmp, "rb") as f:
-        data = f.read().decode("utf-8")
-    lines = data.split("\r\n")
-    check("行数 = 头 6 + 事件 4 + 尾空", len(lines) == 6 + 4 + 1, str(len(lines)))
-    check("版本头", lines[0] == "# genshin-lyre-script v1")
-    check("乐器头", lines[2] == "# instrument=原琴（三排）", lines[2])
-    check("事件行", lines[6] == "0.000\tA" and lines[7] == "1.000\tD")
-    check("CRLF + UTF-8", data.endswith("\r\n") and "\tA\r\n" in data)
-    check("返回事件数", n == 4)
-    # 分:秒 格式 + 速度缩放
-    export_script(r, MapParams(), tmp, clock_format=True, include_header=False, speed=2.0)
-    data = open(tmp, "rb").read().decode("utf-8")
-    check("速度缩放 200%", "00:00.500\tD" in data and "00:01.000\tG" in data, data[:60])
-    os.remove(tmp)
+def test_export():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = os.path.join(td, "test_out.txt")
+        r = map_song(_song_of([60, 64, 67, 72], dur=960), MapParams())
+        n = export_script(r, MapParams(), tmp, source_name="test.mid")
+        with open(tmp, "rb") as f:
+            data = f.read().decode("utf-8")
+        lines = data.split("\r\n")
+        check("行数 = 头 6 + 事件 4 + 尾空", len(lines) == 6 + 4 + 1, str(len(lines)))
+        check("版本头", lines[0] == "# genshin-lyre-script v1")
+        check("乐器头", lines[2] == "# instrument=原琴（三排）", lines[2])
+        check("事件行", lines[6] == "0.000\tA" and lines[7] == "1.000\tD")
+        check("CRLF + UTF-8", data.endswith("\r\n") and "\tA\r\n" in data)
+        check("返回事件数", n == 4)
+        # 分:秒 格式 + 速度缩放
+        export_script(r, MapParams(), tmp, clock_format=True, include_header=False, speed=2.0)
+        data = open(tmp, "rb").read().decode("utf-8")
+        check("速度缩放 200%", "00:00.500\tD" in data and "00:01.000\tG" in data, data[:60])
+        # 非法速度拒绝
+        try:
+            export_script(r, MapParams(), tmp, speed=float("nan"))
+            check("非法速度拒绝", False)
+        except ValueError:
+            check("非法速度拒绝", True)
 
 
 # ---------------- 动作表 ----------------
@@ -423,40 +438,89 @@ def test_blackkey_drop_stat():
     check("吸附模式黑键丢弃为 0", r.stats.dropped_blackkey == 0)
 
 
-def test_script_roundtrip(tmp="test_script.txt"):
-    # 导出 -> 回读 -> 事件一致
-    r = map_song(_song_of([60, 64, 67], dur=960), MapParams())
-    n = export_script(r, MapParams(), tmp, source_name="rt.mid")
-    _, r2, meta = parse_script(tmp)
-    check("回读事件数一致", len(r2.events) == len(r.events) == 4 or
-          len(r2.events) == len(r.events), f"{len(r2.events)} vs {len(r.events)}")
-    check("回读组合一致", [e.combo for e in r2.events] == [e.combo for e in r.events])
-    check("回读时间一致", [round(e.time, 3) for e in r2.events] ==
-          [round(e.time, 3) for e in r.events])
-    check("回读头部 source", meta["source"] == "rt.mid")
-    check("回读乐器头", meta["instrument"] == "原琴（三排）")
-    # 非法键名
-    with open(tmp, "wb") as f:
-        f.write("0.000\tZZZ\r\n".encode("utf-8"))
-    try:
-        parse_script(tmp)
-        check("非法键名拒绝", False)
-    except ValueError:
-        check("非法键名拒绝", True)
-    # 时间乱序
-    with open(tmp, "wb") as f:
-        f.write("1.000\tA\r\n0.500\tS\r\n".encode("utf-8"))
-    try:
-        parse_script(tmp)
-        check("时间乱序拒绝", False)
-    except ValueError:
-        check("时间乱序拒绝", True)
-    os.remove(tmp)
+def test_script_roundtrip():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = os.path.join(td, "test_script.txt")
+        # 导出 -> 回读 -> 事件一致
+        r = map_song(_song_of([60, 64, 67], dur=960), MapParams())
+        n = export_script(r, MapParams(), tmp, source_name="rt.mid")
+        _, r2, meta = parse_script(tmp)
+        check("回读事件数一致", len(r2.events) == len(r.events) == 4 or
+              len(r2.events) == len(r.events), f"{len(r2.events)} vs {len(r.events)}")
+        check("回读组合一致", [e.combo for e in r2.events] == [e.combo for e in r.events])
+        check("回读时间一致", [round(e.time, 3) for e in r2.events] ==
+              [round(e.time, 3) for e in r.events])
+        check("回读头部 source", meta["source"] == "rt.mid")
+        check("回读乐器头", meta["instrument"] == "原琴（三排）")
+        # 非法键名
+        with open(tmp, "wb") as f:
+            f.write("0.000\tZZZ\r\n".encode("utf-8"))
+        try:
+            parse_script(tmp)
+            check("非法键名拒绝", False)
+        except ValueError:
+            check("非法键名拒绝", True)
+        # 时间乱序
+        with open(tmp, "wb") as f:
+            f.write("1.000\tA\r\n0.500\tS\r\n".encode("utf-8"))
+        try:
+            parse_script(tmp)
+            check("时间乱序拒绝", False)
+        except ValueError:
+            check("时间乱序拒绝", True)
+
+
+def test_script_roundtrip_extensions():
+    """回读扩展：时钟格式 / 前导时间 / 缩放时长 / 非法数值 / 空格来源 / v2 校验。"""
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "ext.txt")
+        # 时钟格式 roundtrip：200% 速度导出，回读时间应为原值的一半
+        r = map_song(_song_of([60, 64], dur=960), MapParams())
+        export_script(r, MapParams(), p, clock_format=True, speed=2.0, include_header=False)
+        _, r2, _meta = parse_script(p)
+        check("时钟格式回读", [round(e.time, 3) for e in r2.events] == [0.0, 0.5],
+              str([e.time for e in r2.events]))
+        # 前导时间保留（不再强制归零）
+        with open(p, "wb") as f:
+            f.write("1.500\tA\r\n2.000\tS\r\n".encode("utf-8"))
+        _, r3, _ = parse_script(p)
+        check("前导时间保留", r3.events[0].time == 1.5 and r3.events[1].time == 2.0,
+              str([e.time for e in r3.events]))
+        # 已按速度缩放的时长保留（不再截断回 0.06/2.0）
+        with open(p, "wb") as f:
+            f.write("0.000\tA\t0.030\r\n0.100\tS\t4.000\r\n".encode("utf-8"))
+        _, r4, meta4 = parse_script(p)
+        check("缩放时长保留", abs(r4.events[0].releases[0] - 0.03) < 1e-6
+              and abs(r4.events[1].releases[0] - 4.0) < 1e-6,
+              str([e.releases for e in r4.events]))
+        check("按实际列判定时长", meta4["has_durations"] is True)
+        # 非法时间/时长拒绝（负数、NaN、非正时长、多段时钟）
+        for bad in ("nan\tA\r\n", "-1\tA\r\n", "0\tA\tnan\r\n", "0\tA\t0\r\n",
+                    "1:2:3\tA\r\n", "inf\tA\r\n"):
+            with open(p, "wb") as f:
+                f.write(bad.encode("utf-8"))
+            try:
+                parse_script(p)
+                check(f"非法脚本拒绝 {bad.strip()!r}", False)
+            except ValueError:
+                check(f"非法脚本拒绝 {bad.strip()!r}", True)
+        # source 含空格时完整保留
+        with open(p, "wb") as f:
+            f.write("# genshin-lyre-script v1\r\n# source=My Song.mid\r\n0.000\tA\r\n"
+                    .encode("utf-8"))
+        _, _, meta6 = parse_script(p)
+        check("source 保留空格", meta6["source"] == "My Song.mid", repr(meta6["source"]))
+        # v2 三列行的键名校验读第二列（曾错取时长列）
+        bad_keys = validate_script_keys("0.000\tZZZ\t0.500\r\n0.100\tA\t0.200\r\n")
+        check("v2 键名校验读组合列", bad_keys == ["ZZZ"], str(bad_keys))
+        # 回读和弦计入统计
+        with open(p, "wb") as f:
+            f.write("0.000\tA+D\r\n".encode("utf-8"))
+        _, r7, _ = parse_script(p)
+        check("回读和弦统计", r7.stats.chord_groups == 1, str(r7.stats.chord_groups))
 
 
 def test_auto_adjust():
-    from genshin_lyre.keys import WIND_HORN, WIND_LYRE
-    from genshin_lyre.mapper import auto_adjust
     # 中音区 C 大调（跨度 12）：两排 +0
     inst, t = auto_adjust(_song_of(list(range(60, 73))), MapParams())
     check("中音区 -> 两排 +0", (inst.id, t) == ("horn", 0), f"{inst.id} {t}")
@@ -466,45 +530,39 @@ def test_auto_adjust():
     # 大跨度（>24）：三排
     inst, t = auto_adjust(_song_of(list(range(45, 89))), MapParams())
     check("大跨度 -> 三排", inst.id == "lyre", inst.id)
-    # 二排劣于三排时不强用二排：高黑键密度大跨度直接三排（由上覆盖）
+    # 评分回归：dropped 相同时直击优先于吸附（B3+C4 → 两排 +5 全直击）
+    inst, t = auto_adjust(_song_of([59, 60]), MapParams())
+    check("半音邻接低音 -> 两排 +5", (inst.id, t) == ("horn", 5), f"{inst.id} {t}")
 
 
 def test_seek():
-    from genshin_lyre.mapper import LyreEvent, MappedKey
-    events = [LyreEvent(time=i * 0.08, keys=[MappedKey("A", 60, False)],
-                        releases=[0.060]) for i in range(120)]  # 9.6s
-    acts = build_actions(events, 1.0, "tap")
-    sender = KeySender(dry_run=True)
-    p = Player(acts, sender)
-    p.start()
-    time.sleep(0.4)          # 约 5 个事件
-    p.seek(60)               # 跳到事件 60（约 4.8s）
-    time.sleep(0.3)
-    p.stop()
-    p.join(timeout=5)
-    downs = [t for t, kind, _ in sender.log if kind == "down"]
-    after_seek = [t for t in downs if t > 0.4]
-    check("跳播后立即从新位置继续", after_seek and min(after_seek) < 0.75,
-          str([round(t, 2) for t in downs[-8:]]))
-    # 跳播地板：事件 60 之前的动作不再发送（统计事件 0-5 后 seek 前）
-    check("演奏线程正常结束", not p.is_alive())
+    """双向跳播 / 暂停跳播 / 起点定位 / 收尾清理（见 tests/test_player_controls.py）。"""
+    from tests.test_player_controls import run_checks
+    run_checks(check)
 
 
-def test_export_v2_follow(tmp="test_v2.txt"):
+def test_export_v2_follow():
     # 跟随音符模式导出 v2，回读后保持时长，可再以 follow 演奏
-    r = map_song(_song_of([60], dur=960), MapParams(hold_mode=HOLD_FOLLOW))
-    export_script(r, MapParams(hold_mode=HOLD_FOLLOW), tmp, include_durations=True)
-    text = open(tmp, encoding="utf-8").read()
-    check("v2 头", "# genshin-lyre-script v2" in text)
-    _, r2, meta = parse_script(tmp)
-    check("v2 回读标记", meta["has_durations"] and meta["version"] == "v2")
-    check("v2 回读时长 0.5s", abs(r2.events[0].releases[0] - 0.5) < 1e-6,
-          str(r2.events[0].releases))
-    # 跟随模式动作表：up 在 1s 处
-    acts = build_actions(r2.events, 1.0, "follow")
-    ups = [a.time for a in acts if a.kind == "up"]
-    check("v2 follow 回读 up@0.5s", ups and abs(ups[0] - 0.5) < 1e-6, str(ups))
-    os.remove(tmp)
+    with tempfile.TemporaryDirectory() as td:
+        tmp = os.path.join(td, "test_v2.txt")
+        r = map_song(_song_of([60], dur=960), MapParams(hold_mode=HOLD_FOLLOW))
+        export_script(r, MapParams(hold_mode=HOLD_FOLLOW), tmp, include_durations=True)
+        text = open(tmp, encoding="utf-8").read()
+        check("v2 头", "# genshin-lyre-script v2" in text)
+        _, r2, meta = parse_script(tmp)
+        check("v2 回读标记", meta["has_durations"] and meta["version"] == "v2")
+        check("v2 回读时长 0.5s", abs(r2.events[0].releases[0] - 0.5) < 1e-6,
+              str(r2.events[0].releases))
+        # 跟随模式动作表：up 在 1s 处
+        acts = build_actions(r2.events, 1.0, "follow")
+        ups = [a.time for a in acts if a.kind == "up"]
+        check("v2 follow 回读 up@0.5s", ups and abs(ups[0] - 0.5) < 1e-6, str(ups))
+        # 短按模式导出 v2：时长固定 60ms（曾错误写出原始时长）
+        r_tap = map_song(_song_of([60], dur=960), MapParams(hold_mode=HOLD_TAP))
+        export_script(r_tap, MapParams(hold_mode=HOLD_TAP), tmp, include_durations=True)
+        _, r2t, _ = parse_script(tmp)
+        check("v2 短按导出 60ms", abs(r2t.events[0].releases[0] - 0.060) < 1e-6,
+              str(r2t.events[0].releases))
 
 
 def main():
@@ -532,6 +590,7 @@ def main():
     test_track_filter()
     test_blackkey_drop_stat()
     test_script_roundtrip()
+    test_script_roundtrip_extensions()
     test_auto_adjust()
     test_seek()
     test_export_v2_follow()

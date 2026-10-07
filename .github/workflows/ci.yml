@@ -13,8 +13,14 @@ jobs:
         with:
           python-version: "3.10"
       - name: Install dependencies
-        run: pip install PySide6
+        run: python -m pip install -r requirements.txt
       - name: Run core pipeline tests
         run: python tests/test_pipeline.py
       - name: Run GUI play-flow tests (dry-run)
         run: python tests/test_gui_play.py
+      - name: Run library tests
+        run: python tests/test_library.py
+      - name: Run start-from tests
+        run: python tests/test_start_from.py
+      - name: Run launcher script tests
+        run: python tests/test_launcher_bat.py

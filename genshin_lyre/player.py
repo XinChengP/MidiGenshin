@@ -1,4 +1,4 @@
-"""前台自动演奏引擎：SendInput 扫描码、高精度计时、F8 急停、暂停/焦点保护。
+"""前台自动演奏引擎：SendInput 扫描码、高精度计时、可选急停键、暂停/焦点保护。
 
 仅向当前前台窗口发送键盘事件；不含任何后台消息、内存注入或反检测设计。
 """
@@ -6,13 +6,14 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import threading
 import time
 from collections import defaultdict
 from ctypes import wintypes
 
 from .keys import KEYS
-from .mapper import HOLD_TAP, LyreEvent
+from .mapper import HOLD_TAP, TAP_HOLD, LyreEvent
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 winmm = ctypes.WinDLL("winmm", use_last_error=True)
@@ -94,8 +95,8 @@ def build_actions(events: list[LyreEvent], speed: float, hold_mode: str) -> list
 
     速度只缩放事件间隔（与跟随音符时长）；短按保持时长不缩放。
     """
-    if speed <= 0:
-        raise ValueError("演奏速度必须大于 0")
+    if not math.isfinite(speed) or speed <= 0:
+        raise ValueError("演奏速度必须是有限正数")
     downs: list[tuple[float, int, list[str]]] = []
     ups: list[tuple[float, str]] = []
     for idx, ev in enumerate(events):
@@ -103,9 +104,9 @@ def build_actions(events: list[LyreEvent], speed: float, hold_mode: str) -> list
         downs.append((t_down, idx, [k.key for k in ev.keys]))
         for mk, release in zip(ev.keys, ev.releases):
             if hold_mode == HOLD_TAP:
-                t_up = t_down + release          # 短按：不随速度缩放
+                t_up = t_down + TAP_HOLD
             else:
-                t_up = (ev.time + release) / speed  # 跟随音符：等比缩放
+                t_up = (ev.time + release) / speed
             ups.append((t_up, mk.key))
 
     # 同键冲突：按时间归并（同时刻先 up 后 down），按下时仍处于按住则插入提前松开
@@ -148,7 +149,7 @@ def build_actions(events: list[LyreEvent], speed: float, hold_mode: str) -> list
     for (t, idx), keys in down_groups.items():
         actions.append(Action(t, "down", tuple(keys), idx))
     up_groups: dict[float, list[str]] = {}
-    for (t, key) in fixed_ups:
+    for t, key in fixed_ups:
         up_groups.setdefault(t, []).append(key)
     for t, keys in up_groups.items():
         actions.append(Action(t, "up", tuple(keys), None))
@@ -200,9 +201,10 @@ class Player(threading.Thread):
         *,
         on_progress=None,                 # fn(event_idx: int)
         on_state=None,                    # fn(state: str, detail: str)
-        focus_guard_hwnd: int | None = None,  # 演奏中切回该窗口则自动暂停
-        stop_vk: int = VK_F8,             # 全局急停键虚拟键码
+        focus_guard_hwnd: int | None = None,
+        stop_vk: int = VK_F8,
         time_scale_check: bool = True,
+        start_event_idx: int = 0,
     ):
         super().__init__(daemon=True, name="lyre-player")
         self.actions = actions
@@ -211,48 +213,68 @@ class Player(threading.Thread):
         self.on_state = on_state
         self.focus_guard_hwnd = focus_guard_hwnd
         self._stop_vk = stop_vk
-        self._seek_pending = False
-        self._seek_time = 0.0
+        self._start_event_idx = start_event_idx
+        self._control_lock = threading.RLock()
+        self._seek_pending: int | None = None
         self._seek_floor = 0
-
+        self._paused_position: float | None = None
         self._stop_evt = threading.Event()
         self._pause_evt = threading.Event()
-        self._pause_reason = "manual"   # manual=手动 / focus=切回本工具自动暂停
+        self._pause_reason = "manual"
         self._origin = 0.0
         self._state = "ready"
         self._held: list[str] = []
-        self._fg_away = True       # 焦点保护：前台曾离开过本窗口
+        self._fg_away = True
         self._focus_check_counter = 0
         self._time_scale_check = time_scale_check
+        self._aborted = False
+        self._error_detail = ""
 
     # ---- 供 GUI 调用的控制 ----
     def pause(self):
-        self._pause_reason = "manual"
-        self._pause_evt.set()
+        with self._control_lock:
+            self._pause_reason = "manual"
+            self._pause_evt.set()
 
     def resume(self):
-        self._pause_evt.clear()
-        # 恢复时重建焦点基线：以当前前台为准，避免"继续后立刻又被自动暂停"
-        if self.focus_guard_hwnd is not None:
-            self._fg_away = get_foreground_hwnd() != self.focus_guard_hwnd
+        with self._control_lock:
+            self._pause_evt.clear()
+            if self.focus_guard_hwnd is not None:
+                self._fg_away = get_foreground_hwnd() != self.focus_guard_hwnd
 
     def stop(self):
-        self._stop_evt.set()
-        self._pause_evt.clear()
-        self._release_all()  # 立即松开，防止进程退出前 keyup 未来得及发送
+        with self._control_lock:
+            self._stop_evt.set()
+            self._pause_evt.clear()
+
+    def _action_index_for_event(self, event_idx: int) -> int | None:
+        for i, action in enumerate(self.actions):
+            if (action.kind == "down" and action.event_idx is not None
+                    and action.event_idx >= event_idx):
+                return i
+        return None
 
     def seek(self, event_idx: int):
-        """跳播：从首个序号 >= event_idx 的按下动作继续（释放当前所有按住的键）。"""
-        target_t = None
-        for a in self.actions:
-            if a.kind == "down" and a.event_idx is not None and a.event_idx >= event_idx:
-                target_t = a.time
-                break
-        if target_t is None:
+        """跳播到首个序号 >= event_idx 的按下动作，暂停状态保持不变。
+
+        _seek_floor 作为发送门槛立即生效：即使演奏线程因负载积压了
+        过期动作正在“追赶”，写入本请求后的旧事件也会被直接丢弃。
+        """
+        if event_idx < 0 or self._action_index_for_event(event_idx) is None:
             return
-        self._seek_floor = event_idx
-        self._seek_time = target_t
-        self._seek_pending = True
+        with self._control_lock:
+            self._seek_floor = event_idx
+            self._seek_pending = event_idx
+
+    def _apply_seek(self, event_idx: int) -> int:
+        target = self._action_index_for_event(event_idx)
+        self._release_all()
+        if target is None:
+            return len(self.actions)
+        position = self.actions[target].time
+        self._origin = time.perf_counter() - position
+        self._paused_position = position if self._pause_evt.is_set() else None
+        return target
 
     # ---- 内部 ----
     def _set_state(self, state: str, detail: str = ""):
@@ -264,15 +286,19 @@ class Player(threading.Thread):
                 pass
 
     def _release_all(self):
-        for key in self._held:
-            self.sender.up(key)
-        self._held = []
+        # 仅演奏线程发送按键；某个松键失败也不能阻止其余按键清理。
+        held, self._held = self._held, []
+        for key in held:
+            try:
+                if not self.sender.up(key):
+                    self._error_detail = "松键发送失败，请检查目标程序与本工具的权限是否一致"
+            except Exception as exc:
+                self._error_detail = f"松键发送失败：{exc}"
 
     def _check_abort_keys(self) -> bool:
-        """返回 True 表示需要终止。"""
         if is_stop_key_pressed(self._stop_vk):
+            self._aborted = True
             self._stop_evt.set()
-            self._set_state("aborted", "hotkey")
             return True
         return False
 
@@ -280,104 +306,129 @@ class Player(threading.Thread):
         if self.focus_guard_hwnd is None or self._pause_evt.is_set():
             return
         self._focus_check_counter += 1
-        if self._focus_check_counter % 25 != 0:  # 约 50ms 一次
+        if self._focus_check_counter % 25 != 0:
             return
         if get_foreground_hwnd() == self.focus_guard_hwnd:
-            if self._fg_away:  # 边沿触发：离开过又切回来才暂停
+            if self._fg_away:
                 self._fg_away = False
                 self._pause_reason = "focus"
                 self._pause_evt.set()
         else:
             self._fg_away = True
 
-    def _wait_until(self, target: float) -> bool:
-        """等到演奏时间轴的 target 秒。返回 False 表示终止。"""
-        while not self._stop_evt.is_set():
-            if self._seek_pending:
-                self._seek_pending = False
-                if self._held:
-                    self._release_all()
-                self._origin = time.perf_counter() - self._seek_time
-            if self._check_abort_keys():
-                return False
-            self._check_focus()
-            if self._stop_evt.is_set():
-                return False
-            if self._pause_evt.is_set():
-                if self._held:
-                    self._release_all()
-                if self._state != "paused":  # 避免每个循环重复发信号
-                    self._set_state("paused", self._pause_reason)
-                # 焦点自动暂停：用户切回游戏（前台离开本工具）则自动恢复，无需点按钮
-                if (self._pause_reason == "focus" and self.focus_guard_hwnd is not None
-                        and get_foreground_hwnd() != self.focus_guard_hwnd):
-                    self._pause_evt.clear()
-                    self._fg_away = True   # 已离开本工具，下次切回可再次触发保护
-                time.sleep(0.02)
-                continue
-            if self._state == "paused":  # 刚恢复：重置时间原点
-                # 若曾跳播，恢复基准不早于跳播点，避免把跳过的时长静默等完
-                self._origin = time.perf_counter() - max(target, self._seek_time)
-                self._set_state("running")
-            now = time.perf_counter() - self._origin
-            remaining = target - now
-            if remaining <= 0:
-                return True
-            if remaining > SPIN_WINDOW:
-                time.sleep(min(COARSE_SLEEP, remaining - SPIN_WINDOW))
-            # 最后几毫秒自旋（循环顶部仍有急停/焦点检查）
-        return False
+    def _wait_until(self, target: float) -> str:
+        """返回 ready / seek / stop；跳播必须放弃正在等待的旧动作。"""
+        while True:
+            with self._control_lock:
+                if self._stop_evt.is_set() or self._check_abort_keys():
+                    return "stop"
+                if self._seek_pending is not None:
+                    return "seek"
+                self._check_focus()
+                now = time.perf_counter()
+                if self._pause_evt.is_set():
+                    if self._paused_position is None:
+                        self._paused_position = max(0.0, now - self._origin)
+                    if self._state != "paused":
+                        self._release_all()
+                        self._set_state("paused", self._pause_reason)
+                    if (self._pause_reason == "focus" and self.focus_guard_hwnd is not None
+                            and get_foreground_hwnd() != self.focus_guard_hwnd):
+                        self._pause_evt.clear()
+                        self._fg_away = True
+                    delay = 0.01
+                else:
+                    if self._paused_position is not None:
+                        self._origin = now - self._paused_position
+                        self._paused_position = None
+                    if self._state == "paused":
+                        self._set_state("running")
+                    remaining = target - (now - self._origin)
+                    if remaining <= 0:
+                        return "ready"
+                    delay = min(COARSE_SLEEP, max(0.0, remaining - SPIN_WINDOW))
+            if delay:
+                self._stop_evt.wait(delay)
 
     # ---- 线程主体 ----
     def run(self):
-        # 焦点保护基线：以开始演奏那一刻的前台为准。
-        # 若开始时前台就是本工具（未切换窗口），先记录"未离开过"，
-        # 等真正离开过再切回时才触发自动暂停，避免一开始就自我暂停。
-        if self.focus_guard_hwnd is not None:
-            self._fg_away = get_foreground_hwnd() != self.focus_guard_hwnd
-        if self._time_scale_check:
-            winmm.timeBeginPeriod(1)
-            try:
-                self._run_loop()
-            finally:
-                winmm.timeEndPeriod(1)
-        else:
+        timer_started = False
+        try:
+            if self.focus_guard_hwnd is not None:
+                self._fg_away = get_foreground_hwnd() != self.focus_guard_hwnd
+            if self._time_scale_check:
+                timer_started = winmm.timeBeginPeriod(1) == 0
             self._run_loop()
+        except Exception as exc:
+            self._error_detail = f"演奏异常：{exc}"
+        finally:
+            self._release_all()
+            if timer_started:
+                winmm.timeEndPeriod(1)
+            if self._error_detail:
+                self._set_state("error", self._error_detail)
+            elif self._aborted:
+                self._set_state("aborted", "hotkey")
+            elif self._stop_evt.is_set():
+                self._set_state("stopped")
+            else:
+                self._set_state("finished")
 
     def _run_loop(self):
         self._origin = time.perf_counter()
+        cursor = self._apply_seek(self._start_event_idx) if self._start_event_idx > 0 else 0
         self._set_state("running")
         consecutive_fail = 0
-        for action in self.actions:
-            if action.time < self._seek_time:
-                # 跳播点之前的动作整体跳过：不等待时间轴、不发送。
-                # 否则暂停中跳播再恢复，会把“当前等待点→跳播点”的时间静默等完。
-                continue
-            if not self._wait_until(action.time):
+        while cursor < len(self.actions):
+            with self._control_lock:
+                if self._stop_evt.is_set():
+                    break
+                if self._seek_pending is not None:
+                    event_idx, self._seek_pending = self._seek_pending, None
+                    cursor = self._apply_seek(event_idx)
+            if cursor >= len(self.actions):
                 break
-            if action.kind == "down":
-                for key in action.keys:
-                    if not self.sender.down(key):
-                        consecutive_fail += 1
-                    else:
-                        consecutive_fail = 0
-                    self._held.append(key)
-                if consecutive_fail >= 10:
-                    self._release_all()
-                    self._set_state("error", "按键发送失败：目标程序可能以管理员运行，"
-                                             "请以管理员身份重新启动本工具")
-                    return
-                if self.on_progress and action.event_idx is not None:
-                    try:
-                        self.on_progress(action.event_idx)
-                    except Exception:
-                        pass
-            else:
-                for key in action.keys:
-                    self.sender.up(key)
-                self._held = [k for k in self._held if k not in action.keys]
-        self._release_all()
-        if not self._stop_evt.is_set():
-            self._set_state("finished")
-        elif self._state not in ("aborted", "error"):
-            self._set_state("stopped")
+            action = self.actions[cursor]
+            ready = self._wait_until(action.time)
+            if ready == "stop":
+                break
+            if ready == "seek":
+                continue
+            with self._control_lock:
+                if self._stop_evt.is_set():
+                    break
+                if self._seek_pending is not None or self._pause_evt.is_set():
+                    continue
+                if (action.kind == "down" and action.event_idx is not None
+                        and action.event_idx < self._seek_floor):
+                    # 跳播请求已生效：追赶中的积压旧事件直接丢弃
+                    cursor += 1
+                    continue
+                if action.kind == "down":
+                    for key in action.keys:
+                        if self._stop_evt.is_set():
+                            break
+                        if key not in self._held:
+                            self._held.append(key)
+                        if not self.sender.down(key):
+                            consecutive_fail += 1
+                        else:
+                            consecutive_fail = 0
+                        if consecutive_fail >= 10:
+                            self._error_detail = ("按键发送失败：目标程序可能以管理员运行，"
+                                                  "请以管理员身份重新启动本工具")
+                            return
+                    if (not self._stop_evt.is_set() and self.on_progress
+                            and action.event_idx is not None):
+                        try:
+                            self.on_progress(action.event_idx)
+                        except Exception:
+                            pass
+                else:
+                    for key in action.keys:
+                        if key in self._held:
+                            if not self.sender.up(key):
+                                self._error_detail = "松键发送失败，请检查目标程序与本工具的权限是否一致"
+                                return
+                            self._held.remove(key)
+                cursor += 1

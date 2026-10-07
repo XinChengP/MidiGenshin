@@ -3,7 +3,7 @@
 把 MIDI 乐曲自动转换为《原神》PC 端原琴可弹的键盘按键时序：预览、导出脚本、倒计时后自动演奏。
 
 [![tests](https://github.com/XinChengP/MidiGenshin/actions/workflows/ci.yml/badge.svg)](https://github.com/XinChengP/MidiGenshin/actions/workflows/ci.yml)
-[![release](https://img.shields.io/badge/release-v1.2-34B49F)](https://github.com/XinChengP/MidiGenshin/releases)
+[![release](https://img.shields.io/badge/release-v1.3-34B49F)](https://github.com/XinChengP/MidiGenshin/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey)
 
@@ -32,14 +32,14 @@
 **演奏**
 - 倒计时（0/3/5/10 秒，置顶浮窗）→ **仅前台**模拟按键（无内存注入 / 后台消息 / 反检测设计）
 - 演奏速度 50%–200%（滑杆或直接输入数值）；按键模式默认「跟随音符时长」，可切短按 60ms
-- **急停键可选 F8–F12**（全局）；暂停 / 继续；进度条拖动**跳播**；演奏中切回工具自动暂停、切回游戏自动恢复
+- **急停键可选 F8–F12**（全局）；暂停 / 继续；进度条拖动**双向跳播**（可回退已播部分）；演奏中切回工具自动暂停、切回游戏自动恢复
 - **连播**：演奏结束按自定义间隔（默认 5 秒）自动开始下一首
-- **从指定位置开始**：预览列表右键设起点（橙色高亮），时间轴前移无空等，可随时清除
+- **从指定位置开始**：预览列表右键设起点（橙色高亮），时间轴前移无空等，可随时清除、演奏中也能跳回起点之前
 
 **预览与导出**
 - 时序列表：和弦着色、吸附标注、时间跳转、Ctrl+C 复制选中行
 - 统计面板：直击 / 吸附 / 各类丢弃、21 键使用分布、BPM 变化表、键位速查
-- 导出 txt 时序脚本（v2 可含时长列，注释头含生成参数）；**拖回窗口即可回读播放**，方便分享
+- 导出 txt 时序脚本（v2 可含时长列，注释头含生成参数）；**拖回窗口即可回读播放**，秒数与 `分:秒.毫秒` 两种时间格式均可回读，方便分享
 - 浅色 / 深色主题（状态栏 🌙 切换）、窗口尺寸记忆、关于页
 
 ## 快速上手
@@ -87,13 +87,14 @@ tests/                 自动化测试与截图自检脚本
 
 ## 测试
 
-共 **165 项**自动化检查：核心管线 108 + 曲库联动 35 + GUI 播放 13 + 起点演奏 9。
+共 **212 项**自动化检查：核心管线 145 + 曲库联动 35 + GUI 播放 17 + 起点演奏 9 + 启动脚本 6。
 
 ```bat
 python tests\test_pipeline.py
 python tests\test_library.py
 python tests\test_gui_play.py
 python tests\test_start_from.py
+python tests\test_launcher_bat.py
 ```
 
 实测演奏计时精度（dry-run）：事件平均误差 ≤0.4ms（验收指标 5ms）。

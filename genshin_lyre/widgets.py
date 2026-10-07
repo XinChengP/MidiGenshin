@@ -13,9 +13,10 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
                                QCheckBox, QComboBox, QDialog, QFileDialog,
                                QFrame, QHBoxLayout, QLabel, QLineEdit,
-                               QRadioButton, QTableView, QVBoxLayout, QWidget)
+                               QPushButton, QRadioButton, QTableView,
+                               QVBoxLayout, QWidget)
 
-from . import theme
+from . import exporter, theme
 from .player import STOP_KEY_VKS, is_stop_key_pressed
 from .keys import pitch_name
 
@@ -25,14 +26,10 @@ def fmt_clock(t: float) -> str:
 
 
 def parse_time_text(text: str) -> float | None:
-    """'83' 或 '1:23' 或 '1:23.5' -> 秒。"""
-    text = text.strip()
+    """'83' 或 '1:23' 或 '1:23.5' -> 秒；非法输入返回 None。"""
     try:
-        if ":" in text:
-            parts = text.split(":")
-            return int(parts[0]) * 60 + float(parts[1])
-        return float(text)
-    except (ValueError, IndexError):
+        return exporter.parse_time(text)
+    except ValueError:
         return None
 
 
@@ -247,6 +244,11 @@ class CountdownOverlay(QWidget):
         self.activateWindow()
         self._timer.start()
         self._tick()
+
+    def abort(self):
+        """静默中止：不发 finished/cancelled 信号（加载新内容时收尾用）。"""
+        self._timer.stop()
+        self.hide()
 
     def _tick(self):
         if is_stop_key_pressed(STOP_KEY_VKS[self._stop_key]):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 from .keys import KEY_NAMES
@@ -19,6 +20,24 @@ def _fmt_clock(t: float) -> str:
     return f"{ms // 60000:02d}:{(ms % 60000) // 1000:02d}.{ms % 1000:03d}"
 
 
+def parse_time(text: str) -> float:
+    """解析时间文本为秒：'83'、'1:23'、'1:23.5' 均可；拒绝负数与非有限值。
+
+    供脚本回读与界面时间跳转共用；非法输入抛 ValueError。
+    """
+    text = text.strip()
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"时间格式无效：{text!r}")
+        t = int(parts[0]) * 60 + float(parts[1])
+    else:
+        t = float(text)
+    if not math.isfinite(t) or t < 0:
+        raise ValueError(f"时间必须是非负有限数：{text!r}")
+    return t
+
+
 def export_script(
     result: MapResult,
     params: MapParams,
@@ -31,8 +50,8 @@ def export_script(
     include_durations: bool = False,  # v2：附加保持时长列，回读可“跟随音符”
 ) -> int:
     """写出到 path，返回事件行数。"""
-    if speed <= 0:
-        raise ValueError("演奏速度必须大于 0")
+    if not math.isfinite(speed) or speed <= 0:
+        raise ValueError("演奏速度必须是有限正数")
     fmt = _fmt_clock if clock_format else _fmt_sec
     lines: list[str] = []
     if include_header:
@@ -52,7 +71,7 @@ def export_script(
         t = e.time / speed
         row = f"{fmt(t)}\t{e.combo}"
         if include_durations:
-            hold = e.hold if params.hold_mode == "tap" else e.hold / speed
+            hold = TAP_HOLD if params.hold_mode == "tap" else e.hold / speed
             row += f"\t{hold:.3f}"
         lines.append(row)
     data = ("\r\n".join(lines) + "\r\n").encode("utf-8")
@@ -66,9 +85,13 @@ def validate_script_keys(text: str) -> list[str]:
     """校验外部脚本键名是否合法，返回非法键名列表（供回读功能使用）。"""
     bad = []
     for line in text.splitlines():
+        line = line.strip()
         if not line or line.startswith("#"):
             continue
-        for key in line.split("\t")[-1].split("+"):
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue  # 事件行至少要有 时间+键组合 两列
+        for key in parts[1].split("+"):
             if key and key not in KEY_NAMES and key not in bad:
                 bad.append(key)
     return bad
@@ -77,12 +100,12 @@ def validate_script_keys(text: str) -> list[str]:
 def parse_script(path: str) -> tuple[list, "MapResult", dict]:
     """回读时序脚本 -> (原始行列表, MapResult, 头部元数据)。
 
-    事件行格式 `<时间>\\t<键1+键2>`；键名必须在 21 键范围内。
-    时间相对首个事件，保持文件中的数值；无音符时长信息（按短按演奏）。
+    事件行格式 `<时间>\\t<键1+键2>[\\t<保持时长>]`；键名必须在 21 键范围内。
+    时间接受秒数或 分:秒.毫秒，保持文件中的数值（不归零、不截断）；
+    含时长列时按“跟随音符”回读，否则按短按演奏。
     """
     from .keys import KEYS
-    from .mapper import (MAX_HOLD, MIN_HOLD, LyreEvent, MappedKey,
-                         MapResult, MapStats)
+    from .mapper import LyreEvent, MappedKey, MapResult, MapStats
 
     with open(path, "rb") as f:
         text = f.read().decode("utf-8")
@@ -96,30 +119,33 @@ def parse_script(path: str) -> tuple[list, "MapResult", dict]:
         if not line:
             continue
         if line.startswith("#"):
-            tokens = line[1:].split()
+            content = line[1:].strip()
+            tokens = content.split()
             for ti, part in enumerate(tokens):
                 if part == "genshin-lyre-script" and ti + 1 < len(tokens):
                     meta["version"] = tokens[ti + 1]
-                    meta["has_durations"] = meta["version"] >= "v2"
-                elif part.startswith("source="):
-                    meta["source"] = part[7:]
-                elif part.startswith("instrument="):
-                    meta["instrument"] = part[11:]
                 elif part.startswith("transpose="):
                     try:
                         meta["transpose"] = int(part[10:])
                     except ValueError:
                         pass
+            # source / instrument 独占一行，取完整值（可含空格）
+            if content.startswith("source="):
+                meta["source"] = content[len("source="):].strip()
+            elif content.startswith("instrument="):
+                meta["instrument"] = content[len("instrument="):].strip()
             continue
         parts = line.split("\t")
         try:
             t_str, combo = parts[0], parts[1]
-            t = float(t_str)
-            hold = float(parts[2]) if len(parts) > 2 else None
+            t = parse_time(t_str)
+            hold = parse_time(parts[2]) if len(parts) > 2 else None
         except (ValueError, IndexError):
             raise ValueError(f"脚本第 {lineno} 行格式无效：{line[:40]!r}")
+        if hold is not None and hold <= 0:
+            raise ValueError(f"脚本第 {lineno} 行保持时长必须为正：{hold}")
         if hold is not None:
-            hold = min(max(hold, MIN_HOLD), MAX_HOLD)
+            meta["has_durations"] = True
         keys = []
         for name in combo.split("+"):
             k = KEYS.get(name)
@@ -136,14 +162,11 @@ def parse_script(path: str) -> tuple[list, "MapResult", dict]:
                                 releases=[hold if hold is not None else TAP_HOLD] * len(mk)))
 
     stats = MapStats(total=sum(len(e.keys) for e in events),
-                     direct=sum(len(e.keys) for e in events))
+                     direct=sum(len(e.keys) for e in events),
+                     chord_groups=sum(1 for e in events if e.is_chord))
     usage: dict[str, int] = {}
     for e in events:
         for k in e.keys:
             usage[k.key] = usage.get(k.key, 0) + 1
-    if events and events[0].time > 0:
-        base = events[0].time  # 时间归零到首个事件
-        for e in events:
-            e.time -= base
     result = MapResult(events=events, stats=stats, key_usage=usage)
     return text, result, meta

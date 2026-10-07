@@ -61,12 +61,10 @@ def main():
     mw.KeySender = lambda: player_mod.KeySender(dry_run=True)
     progress = []
     win.cmb_countdown.setCurrentIndex(0)  # 无倒计时
-    real_sender_holder = {}
+    win.sig_progress.connect(progress.append)  # 先订阅再启动，避免首条进度竞态丢失
     win._start_playback()
-    # 替换 progress 回调起点验证：直接查 sender.log
     player = win.player
     assert player is not None
-    player.on_progress = lambda idx: progress.append(idx)
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and len(progress) < 3:
         app.processEvents()

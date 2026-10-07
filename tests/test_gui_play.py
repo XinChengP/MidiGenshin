@@ -105,6 +105,26 @@ def main():
     check("播放按钮恢复可用", win.btn_play.isEnabled())
     check("浮窗已清理", win._overlay is None)
 
+    # —— 导出对话框构造回归：widgets 曾缺 QPushButton 导入，打开即 NameError ——
+    from genshin_lyre.widgets import ExportDialog
+    dlg = ExportDialog(win, "out_test.txt")
+    check("导出对话框构造正常", dlg.path == "out_test.txt" and dlg.include_header
+          and not dlg.clock_format and not dlg.include_durations)
+    dlg.deleteLater()
+
+    # —— 脚本导入：速度滑杆/数值框状态一致，可直接播放 ——
+    import tempfile
+    script_path = os.path.join(tempfile.gettempdir(), "lyre_gui_test_script.txt")
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write("0.000\tA\r\n0.500\tS\r\n1.000\tD\r\n")
+    win.load_file(script_path)
+    check("脚本导入进入脚本模式", win.script_mode and win.result is not None
+          and len(win.result.events) == 3)
+    check("脚本模式速度滑杆/数值框状态一致",
+          win.sld_speed.isEnabled() == win.spin_speed.isEnabled())
+    check("脚本可直接播放", win.btn_play.isEnabled())
+    os.remove(script_path)
+
     mw.KeySender = sent
     win.close()
     print(f"\n全部通过：{PASS} 项检查")

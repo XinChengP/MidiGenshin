@@ -214,7 +214,7 @@ def auto_adjust(song: MidiSong, params: MapParams) -> tuple[Instrument, int]:
 def suggest_transpose(song: MidiSong, params: MapParams) -> int:
     """枚举 -12..+12：丢弃最少优先，其次直击最多，最后移调幅度小者优先。"""
     best = 0
-    best_score = (-1, -1, 1)  # (丢弃数升序, 直击数降序, 幅度升序)
+    best_score = None  # (丢弃数升序, 直击数降序, 幅度升序)；None=尚无有效候选
     for t in range(-12, 13):
         try:
             p = MapParams(instrument=params.instrument, transpose=t,
@@ -224,7 +224,7 @@ def suggest_transpose(song: MidiSong, params: MapParams) -> int:
         except ValueError:
             continue
         score = (-result.stats.dropped, result.stats.direct, -abs(t))
-        if score > best_score:
+        if best_score is None or score > best_score:
             best_score = score
             best = t
     return best
