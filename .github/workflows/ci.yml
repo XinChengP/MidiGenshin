@@ -7,6 +7,10 @@ on:
 jobs:
   pipeline:
     runs-on: windows-latest
+    env:
+      # GitHub 的 Windows 服务器默认编码是 cp1252，无法输出测试里的中文，
+      # 强制 Python 使用 UTF-8，避免 UnicodeEncodeError 导致测试中断
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
